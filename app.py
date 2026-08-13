@@ -1,6 +1,9 @@
 import streamlit as st
 from groq import Groq
 import pdfplumber
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 st.set_page_config(page_title="Analisador Contábil", page_icon="📊", layout="wide")
 
@@ -16,43 +19,55 @@ pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=[
 
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
-        with st.spinner("Lendo documento e extraindo indicadores contábeis..."):
+        with st.spinner("Lendo documento e extraindo dados (pode levar alguns segundos se for escaneado)..."):
             try:
-                # 1. Extração robusta de texto e tabelas usando pdfplumber
+                bytes_data = pdf_file.read()
                 texto_pdf = ""
+
+                # 1. Tentativa de extração direta via pdfplumber
                 with pdfplumber.open(pdf_file) as pdf:
                     for page in pdf.pages:
-                        texto_pagina = page.extract_text()
-                        if texto_pagina:
-                            texto_pdf += texto_pagina + "\n"
+                        t = page.extract_text()
+                        if t:
+                            texto_pdf += t + "\n"
 
-                # Trava de segurança: se o texto extraído for muito curto
+                # 2. Se o PDF for uma imagem escaneada, aplica OCR (Reconhecimento Óptico)
                 if len(texto_pdf.strip()) < 50:
-                    st.error("⚠️ Não foi possível extrair o texto deste PDF. O arquivo pode ser uma imagem digitalizada sem camada de OCR.")
+                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR...")
+                    images = convert_from_bytes(bytes_data)
+                    texto_pdf = ""
+                    for img in images:
+                        # Extrai o texto da imagem em português
+                        texto_ocr = pytesseract.image_to_string(img, lang="por")
+                        texto_pdf += texto_ocr + "\n"
+
+                # Trava de segurança final
+                if len(texto_pdf.strip()) < 30:
+                    st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 2. Conexão com a Groq
+                # 3. Envio para a Groq (Llama 3.3)
                 client = Groq(api_key=groq_api_key)
                 
                 prompt = f"""
-                Você é um auditor contábil sênior. Analise APENAS os dados reais contidos no texto contábil abaixo. 
-                NÃO invente, estime ou use números fictícios. Se uma informação não constar no texto, diga expressamente que não foi informada.
+                Você é um auditor contábil sênior. Analise APENAS os dados reais contidos no texto extraído do documento abaixo.
+                NÃO invente, estime ou use números fictícios.
 
                 --- TEXTO EXTRAÍDO DO PDF ---
                 {texto_pdf}
                 -----------------------------
 
-                Forneça um relatório completo em Markdown nos seguintes tópicos:
+                Forneça um relatório em Markdown estruturado nos tópicos:
                 1. 📈 **RESULTADO DO PERÍODO:** A empresa teve Lucro ou Prejuízo no ano? Qual o valor exato? (Busque pelo Lucro/Prejuízo Líquido do Exercício na DRE).
-                2. 💳 **ANÁLISE DE DÍVIDAS E PASSIVOS:** Apresente os valores do Passivo Circulante, Passivo Não Circulante e total de empréstimos/financiamentos.
+                2. 💳 **ANÁLISE DE DÍVIDAS E PASSIVOS:** Apresente os valores do Passivo Circulante, Passivo Não Circulante e Empréstimos/Financiamentos.
                 3. ⚖️ **BALANÇO PATRIMONIAL:** Qual o valor do Patrimônio Líquido? Há prejuízos acumulados?
-                4. 💡 **DIAGNÓSTICO E RECOMENDAÇÕES:** Resumo em 3 parágrafos para a diretoria sobre a saúde financeira observada nos dados reais.
+                4. 💡 **DIAGNÓSTICO E RECOMENDAÇÕES:** Resumo em 3 parágrafos para a diretoria com base nos dados reais lidos.
                 """
 
                 response = client.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
-                    temperature=0.1 # Temperatura baixa para evitar alucinações
+                    temperature=0.1
                 )
 
                 st.success("Análise concluída com sucesso!")
