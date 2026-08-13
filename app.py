@@ -5,16 +5,20 @@ import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
 
+# Configuração da página
 st.set_page_config(page_title="Analisador Contábil", page_icon="📊", layout="wide")
 
 st.title("📊 Analisador Inteligente de Balanços e DRE")
 st.markdown("Suba o arquivo PDF contábil da empresa para gerar o diagnóstico de lucros, prejuízos e dívidas.")
 
+# Busca a chave salva nos Secrets do Streamlit ou pede na barra lateral
 if "GROQ_API_KEY" in st.secrets:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 else:
     groq_api_key = st.sidebar.text_input("Insira sua API Key da Groq (Grátis):", type="password")
+    st.sidebar.info("Pegue sua chave gratuita em: https://console.groq.com/")
 
+# Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
 
 if pdf_file and groq_api_key:
@@ -50,18 +54,18 @@ if pdf_file and groq_api_key:
                 client = Groq(api_key=groq_api_key)
                 
                 prompt = f"""
-                Você é um auditor contábil sênior. Analise APENAS os dados reais contidos no texto extraído do documento abaixo.
-                NÃO invente, estime ou use números fictícios.
+                Você é um auditor contábil sênior. Analise APENAS os dados contidos no texto extraído do documento abaixo.
+                Atenção: O texto foi extraído via OCR de um documento escaneado. Preste muita atenção aos números de Lucro Líquido, Passivo Não Circulante (Exigível Não Circulante) e Prejuízos Acumulados.
 
                 --- TEXTO EXTRAÍDO DO PDF ---
                 {texto_pdf}
                 -----------------------------
 
-                Forneça um relatório em Markdown estruturado nos tópicos:
-                1. 📈 **RESULTADO DO PERÍODO:** A empresa teve Lucro ou Prejuízo no ano? Qual o valor exato? (Busque pelo Lucro/Prejuízo Líquido do Exercício na DRE).
-                2. 💳 **ANÁLISE DE DÍVIDAS E PASSIVOS:** Apresente os valores do Passivo Circulante, Passivo Não Circulante e Empréstimos/Financiamentos.
-                3. ⚖️ **BALANÇO PATRIMONIAL:** Qual o valor do Patrimônio Líquido? Há prejuízos acumulados?
-                4. 💡 **DIAGNÓSTICO E RECOMENDAÇÕES:** Resumo em 3 parágrafos para a diretoria com base nos dados reais lidos.
+                Forneça um relatório em Markdown nos seguintes tópicos:
+                1. 📈 **RESULTADO DO PERÍODO:** Qual o valor exato do Lucro ou Prejuízo Líquido do Exercício no final da DRE?
+                2. 💳 **ANÁLISE DE DÍVIDAS E PASSIVOS:** Apresente o Passivo Circulante, procure pela linha 'EXIGIVEL NÃO CIRCULANTE' para o longo prazo, e liste os Empréstimos/Financiamentos.
+                3. ⚖️ **BALANÇO PATRIMONIAL:** Informe o valor do Patrimônio Líquido e procure o valor exato na linha 'PREJUIZO ACUMULADO' dentro do Patrimônio Líquido.
+                4. 💡 **DIAGNÓSTICO E RECOMENDAÇÕES:** Resumo em 3 parágrafos para a diretoria com base nos indicadores encontrados.
                 """
 
                 response = client.chat.completions.create(
@@ -70,9 +74,13 @@ if pdf_file and groq_api_key:
                     temperature=0.1
                 )
 
+                # 4. Exibição do relatório final
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
                 st.markdown(response.choices[0].message.content)
 
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
+
+elif pdf_file and not groq_api_key:
+    st.warning("⚠️ Insira a sua API Key da Groq para continuar.")
