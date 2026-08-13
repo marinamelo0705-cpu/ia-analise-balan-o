@@ -1,4 +1,4 @@
-import streamlit as st
+=import streamlit as st
 from groq import Groq
 import pdfplumber
 import pytesseract
@@ -28,21 +28,23 @@ if pdf_file and groq_api_key:
                 bytes_data = pdf_file.read()
                 texto_pdf = ""
 
-                # 1. Tentativa de extração direta via pdfplumber
+                # 1. Tentativa de extração direta via pdfplumber (para PDFs digitais)
                 with pdfplumber.open(pdf_file) as pdf:
                     for page in pdf.pages:
                         t = page.extract_text()
                         if t:
                             texto_pdf += t + "\n"
 
-                # 2. Se o PDF for uma imagem escaneada, aplica OCR (Reconhecimento Óptico)
+                # 2. Se o PDF for uma imagem escaneada, aplica OCR otimizado
                 if len(texto_pdf.strip()) < 50:
-                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR...")
+                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem...")
                     images = convert_from_bytes(bytes_data)
                     texto_pdf = ""
                     for img in images:
-                        # Extrai o texto da imagem em português
-                        texto_ocr = pytesseract.image_to_string(img, lang="por")
+                        # Converte para escala de cinza para reduzir interferência de assinaturas/rabiscos
+                        img_gray = img.convert('L')
+                        # OCR com configuração psm 6 (preserva tabelas e blocos de texto)
+                        texto_ocr = pytesseract.image_to_string(img_gray, lang="por", config='--psm 6')
                         texto_pdf += texto_ocr + "\n"
 
                 # Trava de segurança final
@@ -55,7 +57,7 @@ if pdf_file and groq_api_key:
                 
                 prompt = f"""
                 Você é um auditor contábil sênior. Analise APENAS os dados contidos no texto extraído do documento abaixo.
-                Atenção: O texto foi extraído via OCR de um documento escaneado. Preste muita atenção aos números de Lucro Líquido, Passivo Não Circulante (Exigível Não Circulante) e Prejuízos Acumulados.
+                Atenção: O texto foi extraído via OCR de um documento escaneado. Preste atenção aos dígitos de números contábeis, especialmente Lucro/Prejuízo Líquido, Passivo Não Circulante (Exigível Não Circulante) e Prejuízos Acumulados.
 
                 --- TEXTO EXTRAÍDO DO PDF ---
                 {texto_pdf}
