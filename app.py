@@ -50,12 +50,16 @@ if pdf_file and groq_api_key:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 3. Envio para a Groq (Llama 3.3) com os novos tópicos detalhados
+                # 3. Envio para a Groq (Llama 3.3) solicitando formatação amarela nos valores
                 client = Groq(api_key=groq_api_key)
                 
                 prompt = f"""
                 Você é um auditor contábil sênior. Analise APENAS os dados contidos no texto extraído do documento abaixo.
                 Atenção: O texto foi extraído via OCR. Preste atenção aos dígitos de números contábeis.
+
+                REGRA OBRIGATÓRIA DE FORMATAÇÃO DE CORES:
+                Sempre que mencionar um valor numérico ou moeda em reais (como R$, totais, subtotais), DEVE obrigatoriamente envolver o valor na sintaxe de cor amarela do Streamlit.
+                Exemplo: :yellow[R$ 46.822.257,59] ou :yellow[R$ 124.302,42].
 
                 --- TEXTO EXTRAÍDO DO PDF ---
                 {texto_pdf}
@@ -64,23 +68,23 @@ if pdf_file and groq_api_key:
                 Forneça um relatório em Markdown altamente estruturado contendo exatamente as seções abaixo:
 
                 ### 1. 🏢 ESTRUTURA DO ATIVO
-                * **Ativo Circulante:** [Valor exato em R$]
-                * **Ativo Não Circulante:** [Valor exato em R$]
-                * **Imobilizado (dentro do Não Circulante):** [Valor exato em R$, se informado]
-                * **Ativo Total:** [Valor exato em R$]
+                * **Ativo Circulante:** :yellow[R$ ...]
+                * **Ativo Não Circulante:** :yellow[R$ ...]
+                * **Imobilizado (dentro do Não Circulante):** :yellow[R$ ...]
+                * **Ativo Total:** :yellow[R$ ...]
 
                 ### 2. 💳 ESTRUTURA DO PASSIVO E PATRIMÔNIO LÍQUIDO
-                * **Passivo Circulante:** [Valor exato em R$]
-                * **Exigível Não Circulante (Passivo Não Circulante):** [Valor exato em R$]
-                * **Patrimônio Líquido:** [Valor exato em R$]
+                * **Passivo Circulante:** :yellow[R$ ...]
+                * **Exigível Não Circulante (Passivo Não Circulante):** :yellow[R$ ...]
+                * **Patrimônio Líquido:** :yellow[R$ ...]
 
                 ### 3. 📈 RESULTADO E PREJUÍZOS
-                * **Resultado do Exercício (Ano):** [Informe se teve Lucro ou Prejuízo no ano e o valor exato em R$]
-                * **Prejuízos Acumulados:** [Informe se há saldo de Prejuízos Acumulados de anos anteriores no Patrimônio Líquido e o valor exato em R$]
+                * **Resultado do Exercício (Ano):** [Informe se teve Lucro ou Prejuízo com valor em :yellow[R$ ...]]
+                * **Prejuízos Acumulados:** [Informe se há saldo de Prejuízos Acumulados com valor em :yellow[R$ ...]]
 
                 ### 4. 💡 DIAGNÓSTICO FINANCEIRO E IDEIAS DE AÇÃO
-                * **Análise da Saúde Financeira:** [Resumo em 2 parágrafos sobre a relação entre o Ativo, Passivo e Patrimônio Líquido]
-                * **Ideias e Recomendações Práticas:** [Forneça 3 a 5 sugestões práticas/ideias estratégicas para os diretores melhorarem a gestão financeira, reduzirem passivos e mitigarem os prejuízos acumulados]
+                * **Análise da Saúde Financeira:** [Resumo em 2 parágrafos sobre a relação entre Ativo, Passivo e Patrimônio Líquido, sempre destacando valores monetários em :yellow[R$ ...]]
+                * **Ideias e Recomendações Práticas:** [3 a 5 sugestões práticas/ideias para os diretores]
                 """
 
                 response = client.chat.completions.create(
@@ -92,7 +96,7 @@ if pdf_file and groq_api_key:
                 # 4. Exibição do relatório final
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
-                st.markdown(response.choices[0].message.content)
+                st.markdown(response.choices[0].message.content, unsafe_allow_html=True)
 
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
