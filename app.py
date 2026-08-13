@@ -50,16 +50,16 @@ if pdf_file and groq_api_key:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 3. Envio para a Groq (Llama 3.3) solicitando formatação amarela nos valores
+                # 3. Envio para a Groq (Llama 3.3) usando tags HTML para a cor amarela
                 client = Groq(api_key=groq_api_key)
                 
                 prompt = f"""
-                Você é um auditor contábil sênior. Analise APENAS os dados contidos no texto extraído do documento abaixo.
-                Atenção: O texto foi extraído via OCR. Preste atenção aos dígitos de números contábeis.
+                Você é um auditor contábil sênior. Analise APENAS os dados explícitos contidos no texto abaixo.
 
-                REGRA OBRIGATÓRIA DE FORMATAÇÃO DE CORES:
-                Sempre que mencionar um valor numérico ou moeda em reais (como R$, totais, subtotais), DEVE obrigatoriamente envolver o valor na sintaxe de cor amarela do Streamlit.
-                Exemplo: :yellow[R$ 46.822.257,59] ou :yellow[R$ 124.302,42].
+                REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
+                1. Dê sempre um espaço entre os títulos/textos e os valores numéricos.
+                2. DESTAQUE EM AMARELO TODOS OS VALORES NUMÉRICOS E DE MOEDA EM REAIS. Para destacar em amarelo, envolva OBRIGATORIAMENTE o valor na tag HTML: <span style="color: #F1C40F; font-weight: bold;">R$ VALOR</span>.
+                3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais.
 
                 --- TEXTO EXTRAÍDO DO PDF ---
                 {texto_pdf}
@@ -68,23 +68,23 @@ if pdf_file and groq_api_key:
                 Forneça um relatório em Markdown altamente estruturado contendo exatamente as seções abaixo:
 
                 ### 1. 🏢 ESTRUTURA DO ATIVO
-                * **Ativo Circulante:** :yellow[R$ ...]
-                * **Ativo Não Circulante:** :yellow[R$ ...]
-                * **Imobilizado (dentro do Não Circulante):** :yellow[R$ ...]
-                * **Ativo Total:** :yellow[R$ ...]
+                * **Ativo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+                * **Ativo Não Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+                * **Imobilizado (dentro do Não Circulante):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+                * **Ativo Total:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 
                 ### 2. 💳 ESTRUTURA DO PASSIVO E PATRIMÔNIO LÍQUIDO
-                * **Passivo Circulante:** :yellow[R$ ...]
-                * **Exigível Não Circulante (Passivo Não Circulante):** :yellow[R$ ...]
-                * **Patrimônio Líquido:** :yellow[R$ ...]
+                * **Passivo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+                * **Exigível Não Circulante (Passivo Não Circulante):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+                * **Patrimônio Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 
                 ### 3. 📈 RESULTADO E PREJUÍZOS
-                * **Resultado do Exercício (Ano):** [Informe se teve Lucro ou Prejuízo com valor em :yellow[R$ ...]]
-                * **Prejuízos Acumulados:** [Informe se há saldo de Prejuízos Acumulados com valor em :yellow[R$ ...]]
+                * **Resultado do Exercício (Ano):** [Informe se teve Lucro ou Prejuízo com valor em <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>]
+                * **Prejuízos Acumulados:** [Informe o valor exato da conta Prejuízos Acumulados em <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>]
 
                 ### 4. 💡 DIAGNÓSTICO FINANCEIRO E IDEIAS DE AÇÃO
-                * **Análise da Saúde Financeira:** [Resumo em 2 parágrafos sobre a relação entre Ativo, Passivo e Patrimônio Líquido, sempre destacando valores monetários em :yellow[R$ ...]]
-                * **Ideias e Recomendações Práticas:** [3 a 5 sugestões práticas/ideias para os diretores]
+                * **Análise da Saúde Financeira:** [Resumo em 2 parágrafos destacando os principais valores em amarelo]
+                * **Ideias e Recomendações Práticas:** [3 a 5 sugestões práticas para a diretoria]
                 """
 
                 response = client.chat.completions.create(
@@ -93,7 +93,7 @@ if pdf_file and groq_api_key:
                     temperature=0.1
                 )
 
-                # 4. Exibição do relatório final
+                # 4. Exibição do relatório final (unsafe_allow_html=True permite o HTML amarelo)
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
                 st.markdown(response.choices[0].message.content, unsafe_allow_html=True)
