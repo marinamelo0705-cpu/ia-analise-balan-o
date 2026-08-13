@@ -1,6 +1,7 @@
-streamlit
-groq
-pdfplumber
-pytesseract
-pdf2image
-Pillow
+streamlit>=1.36
+groq>=0.9.0
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+Pillow>=10.0.0
+plotly>=5.22.0
