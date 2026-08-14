@@ -395,7 +395,11 @@ def extrair_dados_estruturados(client, texto_pdf):
 # "1.438.819,63" saiu como "1.438,819,63"). Qual separador é o decimal fica
 # a cargo de parse_valor_brl (usa sempre o ÚLTIMO separador antes de 2 dígitos
 # finais, seja "." ou ",").
-PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\s?[.,]\s?\d{3})*\s?[.,]\s?\d{2}\)?")
+# (?!\d) no final: sem isso, um número corrompido pelo OCR (ex.: "14.913.6"
+# de um "14.913.651,90" truncado) casava parcialmente como "14.91" em vez de
+# simplesmente não casar — confirmado com o texto real do usuário. O
+# lookahead impede que o "match" pare no meio de um número ainda em curso.
+PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\s?[.,]\s?\d{3})*\s?[.,]\s?\d{2}\)?(?!\d)")
 
 
 def _limpar_valor_ocr(v):
@@ -416,9 +420,14 @@ ROTULOS_FALLBACK = {
     "receita_liquida": r"receita\s+l[íi]quida",
     "custo_produtos_servicos": r"custo\s+(dos?\s+)?(produtos?|mercadorias?|servi[çc]os?)",
     "lucro_bruto": r"lucro\s+bruto",
-    "despesas_operacionais": r"despesas?\s+operacionais?",
+    "despesas_operacionais": r"despesas?\s+(operacionais?|administrativas?)",
     "receitas_financeiras": r"receitas?\s+financeiras?",
-    "despesas_financeiras": r"despesas?\s+financeiras?",
+    # "despesas_financeiras" NÃO entra aqui: confirmado com o texto real que
+    # "Despesas Financeiras" costuma vir imediatamente seguido de "Receitas
+    # Financeiras <valor>" no mesmo trecho (sem quebra de linha real) — uma
+    # busca só-pra-frente (Passo A) acaba pegando o valor de Receitas
+    # Financeiras por engano. O valor de Despesas Financeiras de fato vem
+    # ANTES do rótulo, então é tratado só pelo Passo C (posicional/bidirecional).
     "resultado_financeiro": r"resultado\s+financeiro",
     "resultado_antes_ir": r"resultado\s+antes\s+(do\s+)?(ir|imposto)",
     "ir_csll": r"(ir\s*/?\s*csll|imposto\s+de\s+renda)",
@@ -427,18 +436,38 @@ ROTULOS_FALLBACK = {
 
 
 def extrair_fallback_regex(texto_pdf):
-    """Varre o texto linha a linha e casa rótulo + valor monetário na mesma linha."""
+    """Varre o texto linha a linha e casa rótulo + valor monetário perto do rótulo.
+
+    Confirmado com o texto real do usuário: este documento tem praticamente
+    nenhuma quebra de linha de verdade (o PDF inteiro virou "2 linhas" após
+    o split por "\\n"), então buscar o valor no resto da linha inteira
+    ("linha[m.end():]") na prática vasculha quase o documento inteiro — o
+    que já causou dois bugs reais: "resultado_exercicio" pegando um valor do
+    título "Demonstração do Resultado do Exercício" (bem longe, sem relação
+    nenhuma), e "resultado_liquido_dre" pegando lixo de OCR de uma
+    assinatura/timestamp. Por isso a busca agora é limitada a uma janela
+    curta logo após o rótulo.
+    """
+    JANELA = 60
     encontrados = {}
     linhas = texto_pdf.split("\n")
     for campo, padrao_rotulo in ROTULOS_FALLBACK.items():
         regex_rotulo = re.compile(padrao_rotulo, re.IGNORECASE)
         for linha in linhas:
-            m = regex_rotulo.search(linha)
-            if not m:
-                continue
-            valores = PADRAO_VALOR.findall(linha[m.end():])
-            if valores:
-                encontrados[campo] = _limpar_valor_ocr(valores[0])
+            for m in regex_rotulo.finditer(linha):
+                # "resultado_exercicio" (conta do balanço) não pode casar
+                # dentro do título da DRE ("Demonstração do Resultado do
+                # Exercício") — confirmado como falso positivo real.
+                if campo == "resultado_exercicio":
+                    contexto_antes = linha[max(0, m.start() - 20): m.start()].lower()
+                    if "demonstra" in contexto_antes:
+                        continue
+                trecho = linha[m.end(): m.end() + JANELA]
+                valores = PADRAO_VALOR.findall(trecho)
+                if valores:
+                    encontrados[campo] = _limpar_valor_ocr(valores[0])
+                    break
+            if campo in encontrados:
                 break
     return encontrados
 
@@ -526,17 +555,24 @@ def extrair_fallback_hierarquico(texto_pdf):
 
 
 ROTULOS_POSICIONAIS_DRE = {
-    "receitas_financeiras": r"receitas?\s+financeiras?",
+    # "receitas_financeiras" e "despesas_operacionais" foram removidos daqui:
+    # testando com o texto real do usuário, os dois têm ordem normal
+    # rótulo->valor (o Passo A, agora com janela e alias "despesas
+    # administrativas", já resolve), e a busca bidirecional deste Passo C
+    # estava "roubando" o valor do vizinho errado — ex.: "despesas
+    # operacionais" (via "Despesas Administrativas") pegava o valor de
+    # "Lucro Bruto" (mais perto, 14 caracteres) em vez do seu próprio valor
+    # correto (25 caracteres, mas na direção certa). Fica só o que realmente
+    # tem valor ANTES do rótulo confirmado no documento real.
     "despesas_financeiras": r"despesas?\s+financeiras?",
-    # "Despesas Operacionais" raramente aparece com esse nome literal — o mais
-    # comum é "Despesas Administrativas", que é a maior linha de despesa
-    # operacional na maioria das DREs brasileiras.
-    "despesas_operacionais": r"despesas?\s+administrativas?",
-    # NOTA: "resultado_liquido_dre" ("LUCRO LÍQUIDO DO EXERCÍCIO ...") foi
-    # testado aqui e removido — o valor sempre vem DEPOIS do rótulo (não tem
-    # o problema de ordem invertida), então o Passo A já cobre esse campo
-    # corretamente. Incluí-lo aqui só criava risco de pegar um número de uma
-    # linha vizinha por engano (confirmado num teste com dados reais).
+    # Confirmado num caso real: quando a página termina com uma assinatura
+    # digital logo após o rótulo (ex.: "LUCRO LÍQUIDO DO EXERCÍCIO, Fá ,, dá
+    # P f / CAR..."), o valor de fato vem ANTES do rótulo, não depois — e não
+    # há nenhum número válido depois dele na mesma janela (só ruído de OCR
+    # da assinatura). Testado com o texto real do usuário: o valor correto
+    # fica a 42 caracteres de distância (antes), contra 60+ de qualquer outro
+    # número vizinho — sem ambiguidade real nesse caso.
+    "resultado_liquido_dre": r"(resultado|lucro)\s+l[íi]quido\s+(do\s+)?exerc[íi]cio",
 }
 
 
