@@ -279,6 +279,8 @@ CAMPOS_DRE = [
     "custo_produtos_servicos",
     "lucro_bruto",
     "despesas_operacionais",
+    "receitas_financeiras",
+    "despesas_financeiras",
     "resultado_financeiro",
     "resultado_antes_ir",
     "ir_csll",
@@ -319,6 +321,16 @@ Leia o número completo mesmo que ele pareça ter mais de 3 grupos de milhar
 copie o número inteiro do primeiro ao último dígito antes da vírgula
 decimal).
 
+ATENÇÃO 5: a DRE às vezes lista VÁRIAS linhas de custo antes do Lucro Bruto
+(ex.: "Custo dos Produtos Vendidos", "Custos Mercadorias Vendidas", "Custos
+dos Serviços Vendidos" — cada uma separada). Nesse caso, copie apenas a
+PRIMEIRA dessas linhas em "custo_produtos_servicos" (o app soma o total
+automaticamente por conta própria depois). Da mesma forma, se o "Resultado
+Financeiro" não aparecer como uma única linha, mas sim como duas linhas
+separadas — "Receitas Financeiras" e "Despesas Financeiras" — copie os dois
+valores separadamente nos campos "receitas_financeiras" e
+"despesas_financeiras" (o app calcula a diferença automaticamente).
+
 --- TEXTO EXTRAÍDO DO(S) PDF(S) ---
 {texto_pdf}
 -----------------------------
@@ -339,10 +351,12 @@ no formato abaixo. Se um valor não existir explicitamente no texto, use null.
   "prejuizos_acumulados": "...",
 
   "receita_liquida": "... (só se houver DRE no texto)",
-  "custo_produtos_servicos": "...",
+  "custo_produtos_servicos": "... (primeira linha de custo, se houver mais de uma — ver ATENÇÃO 5)",
   "lucro_bruto": "...",
   "despesas_operacionais": "...",
-  "resultado_financeiro": "...",
+  "receitas_financeiras": "... (só se vier como linha separada — ver ATENÇÃO 5)",
+  "despesas_financeiras": "... (só se vier como linha separada — ver ATENÇÃO 5)",
+  "resultado_financeiro": "... (só se vier como uma única linha combinada)",
   "resultado_antes_ir": "...",
   "ir_csll": "...",
   "resultado_liquido_dre": "... (resultado líquido final da DRE)",
@@ -403,6 +417,8 @@ ROTULOS_FALLBACK = {
     "custo_produtos_servicos": r"custo\s+(dos?\s+)?(produtos?|mercadorias?|servi[çc]os?)",
     "lucro_bruto": r"lucro\s+bruto",
     "despesas_operacionais": r"despesas?\s+operacionais?",
+    "receitas_financeiras": r"receitas?\s+financeiras?",
+    "despesas_financeiras": r"despesas?\s+financeiras?",
     "resultado_financeiro": r"resultado\s+financeiro",
     "resultado_antes_ir": r"resultado\s+antes\s+(do\s+)?(ir|imposto)",
     "ir_csll": r"(ir\s*/?\s*csll|imposto\s+de\s+renda)",
@@ -727,7 +743,7 @@ def validar_dre(n):
 # ou não com parênteses/sinal de menos. A IA às vezes preserva esse sinal e
 # às vezes não (variação normal entre chamadas), então em vez de depender
 # dela acertar, forçamos o sinal certo aqui — determinístico, sem IA.
-CAMPOS_DRE_SEMPRE_NEGATIVOS = ("custo_produtos_servicos", "despesas_operacionais")
+CAMPOS_DRE_SEMPRE_NEGATIVOS = ("custo_produtos_servicos", "despesas_operacionais", "despesas_financeiras")
 
 
 def normalizar_sinais_dre(dados_num):
@@ -736,6 +752,60 @@ def normalizar_sinais_dre(dados_num):
         valor = dados_num.get(campo)
         if valor is not None:
             dados_num[campo] = -abs(valor)
+
+
+def corrigir_custo_total_dre(dados_num):
+    """
+    A DRE às vezes lista VÁRIAS linhas de custo/dedução antes do Lucro Bruto
+    (ex.: "Custo dos Produtos Vendidos" + "Custos de Mercadorias Vendidas" +
+    "Custos dos Serviços Vendidos", cada uma numa linha separada) — mas o app
+    só extrai UM campo "custo_produtos_servicos". Isso já causou um caso real
+    em que o valor exibido era só a primeira linha, deixando o rótulo
+    enganoso (parecia ser o custo total, mas não era).
+
+    Lucro Bruto = Receita Líquida − Custos Totais é uma identidade contábil
+    (não uma estimativa) — sempre que temos Receita Líquida e Lucro Bruto,
+    usamos essa equação pra calcular o custo TOTAL verdadeiro e substituímos
+    o valor extraído por ele, caso sejam diferentes. Retorna o valor total
+    (positivo) se uma correção foi aplicada, ou None caso contrário.
+    """
+    receita = dados_num.get("receita_liquida")
+    lucro_bruto = dados_num.get("lucro_bruto")
+    if receita is None or lucro_bruto is None:
+        return None
+
+    custo_total_esperado = receita - lucro_bruto
+    if custo_total_esperado <= 0:
+        return None  # não faz sentido como custo — não mexe
+
+    custo_atual = dados_num.get("custo_produtos_servicos")
+    if custo_atual is not None and abs(abs(custo_atual) - custo_total_esperado) <= tolerancia(custo_total_esperado):
+        return None  # já bate, nada a corrigir
+
+    dados_num["custo_produtos_servicos"] = -custo_total_esperado
+    return custo_total_esperado
+
+
+def derivar_resultado_financeiro(dados_num):
+    """
+    Quando o PDF não tem uma linha única "Resultado Financeiro", mas tem
+    "Receitas Financeiras" e "Despesas Financeiras" em linhas separadas
+    (comum em DREs mais detalhadas), calculamos o resultado financeiro
+    líquido pela diferença entre elas — uma soma simples, não uma estimativa.
+    Só atua se "resultado_financeiro" ainda estiver vazio, pra não
+    sobrescrever um valor que já veio certo do texto. Retorna o valor
+    calculado, ou None se não havia base para calcular.
+    """
+    if dados_num.get("resultado_financeiro") is not None:
+        return None
+    receitas_fin = dados_num.get("receitas_financeiras")
+    despesas_fin = dados_num.get("despesas_financeiras")
+    if receitas_fin is None or despesas_fin is None:
+        return None
+
+    valor = receitas_fin - abs(despesas_fin)
+    dados_num["resultado_financeiro"] = valor
+    return valor
 
 
 # =========================================================
@@ -823,9 +893,11 @@ DADOS DO BALANÇO
 
 DADOS DA DRE (se disponíveis; ignore se todos forem N/D)
 - Receita Líquida: {receita_liquida}
-- Custo dos Produtos/Serviços: {custo_produtos_servicos}
+- Custo Total (Produtos + Mercadorias + Serviços): {custo_produtos_servicos}
 - Lucro Bruto: {lucro_bruto}
 - Despesas Operacionais: {despesas_operacionais}
+- Receitas Financeiras: {receitas_financeiras}
+- Despesas Financeiras: {despesas_financeiras}
 - Resultado Financeiro: {resultado_financeiro}
 - Resultado antes do IR/CSLL: {resultado_antes_ir}
 - IR/CSLL: {ir_csll}
@@ -908,9 +980,11 @@ def montar_secao_dre(b):
 ### 📄 Demonstração do Resultado do Exercício (DRE)
 
 * **Receita Líquida:** {destaque(b['receita_liquida'])}
-* **Custo dos Produtos/Serviços Vendidos:** {destaque(b['custo_produtos_servicos'])}
+* **Custo Total (Produtos + Mercadorias + Serviços):** {destaque(b['custo_produtos_servicos'])}
 * **Lucro Bruto:** {destaque(b['lucro_bruto'])}
 * **Despesas Operacionais:** {destaque(b['despesas_operacionais'])}
+* **Receitas Financeiras:** {destaque(b['receitas_financeiras'])}
+* **Despesas Financeiras:** {destaque(b['despesas_financeiras'])}
 * **Resultado Financeiro:** {destaque(b['resultado_financeiro'])}
 * **Resultado antes do IR/CSLL:** {destaque(b['resultado_antes_ir'])}
 * **IR/CSLL:** {destaque(b['ir_csll'])}
@@ -960,6 +1034,21 @@ if pdf_balanco and groq_api_key:
 
         dados_num = {c: parse_valor_brl(dados.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
         normalizar_sinais_dre(dados_num)
+
+        custo_total_corrigido = corrigir_custo_total_dre(dados_num)
+        if custo_total_corrigido:
+            st.caption(
+                "🧮 O Custo dos Produtos/Serviços extraído era só uma das linhas de custo da DRE. "
+                "Pela equação contábil (Lucro Bruto = Receita Líquida − Custos), o custo total é "
+                f"{formatar_brl(-custo_total_corrigido)} — corrigido automaticamente."
+            )
+
+        resultado_financeiro_calculado = derivar_resultado_financeiro(dados_num)
+        if resultado_financeiro_calculado is not None:
+            st.caption(
+                "🧮 O Resultado Financeiro não veio como uma linha única no texto — calculado como "
+                f"Receitas Financeiras − Despesas Financeiras: {formatar_brl(resultado_financeiro_calculado)}."
+            )
 
         correcao_anc = corrigir_confusao_imobilizado(dados_num, texto_completo)
         if correcao_anc:
