@@ -530,6 +530,43 @@ def preencher_campos_faltantes(dados, texto_pdf):
     return recuperados
 
 
+def corrigir_confusao_imobilizado(dados_num, texto_pdf):
+    """
+    Bug observado num caso real: a IA às vezes devolve exatamente o mesmo
+    valor para 'ativo_nao_circulante' e para 'imobilizado' — ou seja, troca o
+    TOTAL da seção pelo valor de apenas UM item dentro dela. Isso é logicamente
+    impossível na estrutura do balanço: o Imobilizado é só um dos componentes
+    do Ativo Não Circulante (junto de Créditos e Valores, Investimentos,
+    Intangível etc.), então o total tem que ser MAIOR que esse componente
+    isolado — a menos que ele seja de fato o único item da seção, o que é raro.
+
+    Quando os dois valores vêm idênticos (dentro da tolerância), isso é sinal
+    forte desse bug específico. Para corrigir, buscamos no texto original um
+    valor para o Ativo Não Circulante por leitura direta (sem IA, via
+    extrair_fallback_hierarquico) e só substituímos se esse candidato for
+    maior que o Imobilizado (ou seja, se ele resolve o problema em vez de
+    repetir o mesmo erro). Retorna o valor corrigido, ou None se não havia
+    sinal do bug ou não foi possível corrigir com segurança.
+    """
+    anc = dados_num.get("ativo_nao_circulante")
+    imo = dados_num.get("imobilizado")
+    if anc is None or imo is None:
+        return None
+    if abs(anc - imo) > tolerancia(imo):
+        return None  # não há sinal desse bug específico
+
+    fallback_hierarquico = extrair_fallback_hierarquico(texto_pdf)
+    valor_fallback = fallback_hierarquico.get("ativo_nao_circulante")
+    if not valor_fallback:
+        return None
+    anc_alt = parse_valor_brl(valor_fallback)
+    if anc_alt is None or anc_alt <= imo:
+        return None  # candidato não resolve o problema
+
+    dados_num["ativo_nao_circulante"] = anc_alt
+    return anc_alt
+
+
 # =========================================================
 # ETAPA 1C: COMPLETAR POR EQUAÇÃO CONTÁBIL (quando falta só 1 peça)
 # =========================================================
@@ -608,6 +645,15 @@ def validar_balanco(n):
                 f"⚠️ Passivo Circulante + Exigível Não Circulante + Patrimônio Líquido ({formatar_brl(soma)}) "
                 f"não bate com o Ativo Total ({formatar_brl(at)}). Pela equação contábil "
                 f"(Ativo = Passivo + PL), esses valores deveriam ser iguais — pode indicar erro de extração."
+            )
+
+    imo = n.get("imobilizado")
+    if imo is not None and anc is not None:
+        if imo > anc + tolerancia(anc):
+            avisos.append(
+                f"⚠️ Imobilizado ({formatar_brl(imo)}) é maior que o Ativo Não Circulante "
+                f"({formatar_brl(anc)}). Como o Imobilizado é só uma parte do Ativo Não Circulante, "
+                f"isso não é possível — provavelmente a extração confundiu os dois valores."
             )
 
     return avisos
@@ -897,6 +943,14 @@ if pdf_balanco and groq_api_key:
             )
 
         dados_num = {c: parse_valor_brl(dados.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
+
+        correcao_anc = corrigir_confusao_imobilizado(dados_num, texto_completo)
+        if correcao_anc:
+            st.caption(
+                "🔧 O Ativo Não Circulante veio idêntico ao Imobilizado — sinal de erro de extração "
+                "(o Imobilizado é só uma parte do Ativo Não Circulante, não o total da seção). "
+                f"Corrigido automaticamente para {formatar_brl(correcao_anc)} usando leitura direta do texto."
+            )
 
         calculados = completar_por_equacao_contabil(dados_num)
         if calculados:
