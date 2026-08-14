@@ -722,6 +722,22 @@ def validar_dre(n):
     return []
 
 
+# Campos da DRE que são, por definição contábil, sempre uma DEDUÇÃO — nunca
+# fazem sentido como valor positivo, independente de o PDF/OCR ter marcado
+# ou não com parênteses/sinal de menos. A IA às vezes preserva esse sinal e
+# às vezes não (variação normal entre chamadas), então em vez de depender
+# dela acertar, forçamos o sinal certo aqui — determinístico, sem IA.
+CAMPOS_DRE_SEMPRE_NEGATIVOS = ("custo_produtos_servicos", "despesas_operacionais")
+
+
+def normalizar_sinais_dre(dados_num):
+    """Garante que custos/despesas da DRE fiquem sempre negativos na exibição."""
+    for campo in CAMPOS_DRE_SEMPRE_NEGATIVOS:
+        valor = dados_num.get(campo)
+        if valor is not None:
+            dados_num[campo] = -abs(valor)
+
+
 # =========================================================
 # ETAPA 3: INDICADORES FINANCEIROS
 # =========================================================
@@ -943,6 +959,7 @@ if pdf_balanco and groq_api_key:
             )
 
         dados_num = {c: parse_valor_brl(dados.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
+        normalizar_sinais_dre(dados_num)
 
         correcao_anc = corrigir_confusao_imobilizado(dados_num, texto_completo)
         if correcao_anc:
