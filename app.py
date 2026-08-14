@@ -46,6 +46,42 @@ MODELO = "llama-3.3-70b-versatile"  # confira em console.groq.com/docs/models se
 LIMIAR_TEXTO_PAGINA = 40  # abaixo disso, a página é considerada "sem texto direto"
 
 
+def ocr_pagina(img):
+    """
+    Roda o Tesseract em português. Se o pacote de idioma 'por' não estiver
+    instalado no ambiente (comum no Streamlit Community Cloud quando o
+    packages.txt não foi aplicado), o Tesseract lança um TesseractError
+    específico ("Failed loading language 'por'") e NENHUM texto sai — isso
+    reproduz exatamente um cenário de "N/D em tudo", porque a IA recebe um
+    texto quase vazio. Detectamos esse erro específico, avisamos bem alto na
+    tela (uma vez por sessão) com o que precisa ser corrigido, e usamos
+    inglês como OCR de emergência só pra não deixar o app 100% cego
+    enquanto isso não é corrigido no deploy.
+    """
+    try:
+        return pytesseract.image_to_string(img, lang="por", config="--psm 4")
+    except pytesseract.TesseractError as e:
+        msg = str(e)
+        if "por" in msg.lower() and ("tessdata" in msg.lower() or "language" in msg.lower()):
+            if not st.session_state.get("aviso_por_ausente"):
+                st.session_state["aviso_por_ausente"] = True
+                st.error(
+                    "🚨 **Causa provável do N/D encontrada**: o pacote de idioma Português do "
+                    "Tesseract OCR não está instalado neste deploy (erro do OCR: "
+                    f"`{msg.strip()}`). Sem ele, o OCR falha silenciosamente em toda página "
+                    "escaneada — é exatamente isso que produz N/D em tudo.\n\n"
+                    "**Como corrigir:** confirme que existe um arquivo `packages.txt` na RAIZ do "
+                    "seu repositório do GitHub (mesmo nível do `app.py`) contendo a linha "
+                    "`tesseract-ocr-por`, depois vá no painel do Streamlit Cloud → seu app → "
+                    "menu ⋮ → **Reboot app**. Sem o reboot, o Cloud não reinstala os pacotes de "
+                    "sistema mesmo após o commit.\n\n"
+                    "Usando inglês como OCR de emergência agora só pra não travar o app, mas a "
+                    "leitura vai sair com bem mais erros até isso ser corrigido."
+                )
+            return pytesseract.image_to_string(img, lang="eng", config="--psm 4")
+        raise
+
+
 def extrair_texto_pdf(bytes_data, rotulo=""):
     """
     Extrai texto página por página, preservando o layout de colunas (Ativo x
@@ -91,10 +127,14 @@ def extrair_texto_pdf(bytes_data, rotulo=""):
         st.info(f"ℹ️ {rotulo}: página(s) {numeros} com pouco texto digital — aplicando OCR nelas individualmente...")
         for i in paginas_para_ocr:
             try:
-                imgs = convert_from_bytes(bytes_data, dpi=300, first_page=i + 1, last_page=i + 1)
+                # DPI 400 (em vez de 300): em balanços digitalizados os totais ao lado de
+                # cabeçalhos como "ATIVO"/"CIRCULANTE" costumam estar em fonte pequena — a
+                # 300 DPI eles frequentemente saem ilegíveis/ausentes do OCR; a 400 DPI ficam
+                # nítidos. Testado diretamente com um balanço real digitalizado.
+                imgs = convert_from_bytes(bytes_data, dpi=400, first_page=i + 1, last_page=i + 1)
                 texto_ocr = ""
                 for img in imgs:
-                    texto_ocr += pytesseract.image_to_string(img.convert("L"), lang="por", config="--psm 4") + "\n"
+                    texto_ocr += ocr_pagina(img.convert("L")) + "\n"
                 texto_paginas[i] = texto_ocr
             except Exception as e:
                 st.warning(f"Não foi possível aplicar OCR na página {i + 1} de {rotulo}: {e}")
@@ -218,11 +258,18 @@ se houver, de uma DRE (Demonstração do Resultado do Exercício). Analise APENA
 os dados explícitos contidos no texto abaixo. NÃO calcule, NÃO invente e NÃO
 estime nenhum valor — copie exatamente o número escrito ao lado de cada conta.
 
-ATENÇÃO 1: balanços patrimoniais brasileiros normalmente têm DUAS colunas lado
-a lado — o ATIVO (esquerda) e o PASSIVO + PATRIMÔNIO LÍQUIDO (direita). Preste
-muita atenção para não confundir "Ativo Circulante" com "Passivo Circulante",
-nem "Ativo Não Circulante" com "Passivo Não Circulante" — são contas diferentes
-que costumam aparecer na mesma altura da página, em colunas diferentes.
+ATENÇÃO 1: balanços patrimoniais brasileiros aparecem em formatos diferentes.
+Pode ser (a) duas colunas lado a lado — ATIVO à esquerda, PASSIVO + PL à
+direita — ou (b) um "balancete" sequencial, onde "ATIVO" e "PASSIVO" aparecem
+como cabeçalhos de seção, cada um seguido por "CIRCULANTE" e depois "NÃO
+CIRCULANTE" como subcabeçalhos (cada um com seu próprio total ao lado, ANTES
+da lista de contas individuais daquela seção), e só depois vem a lista
+detalhada de contas (ex.: Caixa, Bancos, Clientes, Estoques...). Nesse
+segundo formato, o valor de "Ativo Circulante" é o número ao lado da palavra
+"CIRCULANTE" que aparece IMEDIATAMENTE DEPOIS do cabeçalho "ATIVO" (e antes
+de "PASSIVO" aparecer) — não confunda com o "CIRCULANTE" que aparece depois
+do cabeçalho "PASSIVO", que é o Passivo Circulante. Preste muita atenção pra
+não confundir os dois lados, seja qual for o formato.
 
 ATENÇÃO 2: valores entre parênteses, como (1.234,56), ou precedidos de sinal
 de menos representam números NEGATIVOS (ex: prejuízo, despesas, deduções).
@@ -285,8 +332,17 @@ def extrair_dados_estruturados(client, texto_pdf):
 # Se a IA devolver null para um campo, tentamos achar o valor "na marra" com
 # regex direto no texto extraído, antes de desistir e mostrar N/D. Isso cobre
 # tanto falhas de leitura do modelo quanto rótulos que ele não reconheceu.
-PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\.\d{3})*,\d{2}\)?")
+#
+# O padrão de valor tolera espaços que o OCR costuma inserir dentro do número
+# (ex.: "13. 474. 832,27" em vez de "13.474.832,27") — testado com OCR real.
+PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\s?\.\s?\d{3})*\s?,\s?\d{2}\)?")
 
+
+def _limpar_valor_ocr(v):
+    return re.sub(r"\s+", "", v).strip()
+
+
+# Passo A: rótulo composto na mesma linha do valor (balanços "resumo", 2 colunas).
 ROTULOS_FALLBACK = {
     "ativo_circulante": r"ativo\s+circulante",
     "ativo_nao_circulante": r"ativo\s+n[ãa]o[\s-]*circulante",
@@ -320,14 +376,79 @@ def extrair_fallback_regex(texto_pdf):
                 continue
             valores = PADRAO_VALOR.findall(linha[m.end():])
             if valores:
-                encontrados[campo] = valores[0].strip()
+                encontrados[campo] = _limpar_valor_ocr(valores[0])
                 break
     return encontrados
 
 
+def extrair_fallback_hierarquico(texto_pdf):
+    """
+    Passo B: alguns balanços (confirmado testando um balanço real) não
+    escrevem "Ativo Circulante" como frase única — em vez disso imprimem
+    "ATIVO" e "CIRCULANTE" como cabeçalhos de seção EM LINHAS SEPARADAS,
+    cada um com seu próprio total ao lado (formato de "balancete"
+    hierárquico: ATIVO > CIRCULANTE > contas individuais > NÃO CIRCULANTE >
+    IMOBILIZADO...). Esse parser acompanha o contexto (dentro de ATIVO ou de
+    PASSIVO) conforme lê o texto de cima pra baixo, então "CIRCULANTE"
+    sozinho vira "ativo_circulante" ou "passivo_circulante" dependendo de
+    qual cabeçalho apareceu por último.
+    """
+    encontrados = {}
+    contexto = None
+
+    def registrar(campo, valor):
+        if campo not in encontrados:
+            encontrados[campo] = _limpar_valor_ocr(valor)
+
+    for linha in texto_pdf.split("\n"):
+        s = linha.strip()
+        # troca (não remove) caracteres de ruído de OCR por espaço, senão
+        # duas palavras coladas por um caractere de ruído (ex: "ATIVO!Secao")
+        # quebram o casamento de fronteira de palavra (\b) do regex abaixo.
+        low = re.sub(r"[^\wçãõáéíóúâêôà,.\-()]", " ", s.lower())
+        low = re.sub(r"\s+", " ", low).strip()
+
+        if re.match(r"^ativo\b", low) and "circulante" not in low:
+            contexto = "ativo"
+            vals = PADRAO_VALOR.findall(s)
+            if vals:
+                registrar("ativo_total", vals[-1])
+            continue
+        if re.match(r"^passivo\b", low) and "circulante" not in low:
+            contexto = "passivo"
+            continue
+        if contexto and re.match(r"^n[ãa]o[\s-]*circulante\b", low):
+            vals = PADRAO_VALOR.findall(s)
+            if vals:
+                registrar(f"{contexto}_nao_circulante", vals[-1])
+            continue
+        if contexto and re.match(r"^circulante\b", low):
+            vals = PADRAO_VALOR.findall(s)
+            if vals:
+                registrar(f"{contexto}_circulante", vals[-1])
+            continue
+        if re.match(r"^imobilizado\b", low):
+            vals = PADRAO_VALOR.findall(s)
+            if vals:
+                registrar("imobilizado", vals[-1])
+            continue
+
+    return encontrados
+
+
 def preencher_campos_faltantes(dados, texto_pdf):
-    """Completa com o fallback regex qualquer campo que a IA deixou null, e devolve a lista dos que foram recuperados assim."""
+    """
+    Completa com fallback regex qualquer campo que a IA deixou null, e devolve
+    a lista dos que foram recuperados assim. Tenta primeiro o Passo A (rótulo
+    composto, ex. "Ativo Circulante" numa frase só) e depois o Passo B
+    (cabeçalhos hierárquicos separados, ex. "ATIVO" e "CIRCULANTE" em linhas
+    distintas) pra qualquer campo que o Passo A não achou.
+    """
     fallback = extrair_fallback_regex(texto_pdf)
+    fallback_hierarquico = extrair_fallback_hierarquico(texto_pdf)
+    for campo, valor in fallback_hierarquico.items():
+        fallback.setdefault(campo, valor)
+
     recuperados = []
     for campo, valor in fallback.items():
         if not dados.get(campo) and campo in CAMPOS_BALANCO + CAMPOS_DRE:
