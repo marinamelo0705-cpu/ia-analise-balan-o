@@ -179,6 +179,14 @@ def parse_valor_brl(valor_str):
     """
     Converte 'R$ 21.966.947,43', '(1.234,56)' (negativo entre parênteses) ou
     '-1.234,56' em float. Retorna None se não houver valor.
+
+    Usa sempre o ÚLTIMO separador ("." ou ",") como decimal, e remove todos
+    os anteriores — em vez de assumir "." = milhar e "," = decimal de forma
+    rígida. Isso importa porque o OCR de balanços reais às vezes mistura os
+    dois caracteres dentro do MESMO número (ex.: "1.438.819,63" sai como
+    "1.438,819,63" — dois separadores diferentes antes do decimal). Como o
+    valor decimal em contabilidade brasileira sempre tem exatamente 2 dígitos,
+    o último separador é sempre o decimal, não importa qual caractere seja.
     """
     if valor_str is None:
         return None
@@ -190,12 +198,21 @@ def parse_valor_brl(valor_str):
     if s.lstrip().startswith("-"):
         negativo = True
 
-    s = re.sub(r"[^0-9,.\-]", "", s)
-    s = s.replace(".", "").replace(",", ".")
-    if s in ("", "-", "."):
+    s = re.sub(r"[^0-9,.]", "", s)
+    if not s:
+        return None
+
+    ultimo_sep = max(s.rfind("."), s.rfind(","))
+    if ultimo_sep == -1:
+        parte_inteira, parte_decimal = s, ""
+    else:
+        parte_inteira = re.sub(r"[.,]", "", s[:ultimo_sep])
+        parte_decimal = s[ultimo_sep + 1:]
+
+    if not parte_inteira and not parte_decimal:
         return None
     try:
-        valor = float(s)
+        valor = float(f"{parte_inteira or '0'}.{parte_decimal or '0'}")
     except ValueError:
         return None
     return -abs(valor) if negativo else valor
@@ -358,8 +375,13 @@ def extrair_dados_estruturados(client, texto_pdf):
 # tanto falhas de leitura do modelo quanto rótulos que ele não reconheceu.
 #
 # O padrão de valor tolera espaços que o OCR costuma inserir dentro do número
-# (ex.: "13. 474. 832,27" em vez de "13.474.832,27") — testado com OCR real.
-PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\s?\.\s?\d{3})*\s?,\s?\d{2}\)?")
+# (ex.: "13. 474. 832,27" em vez de "13.474.832,27") e também aceita "." OU ","
+# como separador de milhar em qualquer posição — em balanços reais o OCR às
+# vezes confunde os dois caracteres dentro do MESMO número (ex.: o real
+# "1.438.819,63" saiu como "1.438,819,63"). Qual separador é o decimal fica
+# a cargo de parse_valor_brl (usa sempre o ÚLTIMO separador antes de 2 dígitos
+# finais, seja "." ou ",").
+PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\s?[.,]\s?\d{3})*\s?[.,]\s?\d{2}\)?")
 
 
 def _limpar_valor_ocr(v):
@@ -407,55 +429,82 @@ def extrair_fallback_regex(texto_pdf):
 
 def extrair_fallback_hierarquico(texto_pdf):
     """
-    Passo B: alguns balanços (confirmado testando um balanço real) não
+    Passo B: alguns balanços (confirmado testando balanços reais) não
     escrevem "Ativo Circulante" como frase única — em vez disso imprimem
-    "ATIVO" e "CIRCULANTE" como cabeçalhos de seção EM LINHAS SEPARADAS,
-    cada um com seu próprio total ao lado (formato de "balancete"
-    hierárquico: ATIVO > CIRCULANTE > contas individuais > NÃO CIRCULANTE >
-    IMOBILIZADO...). Esse parser acompanha o contexto (dentro de ATIVO ou de
-    PASSIVO) conforme lê o texto de cima pra baixo, então "CIRCULANTE"
-    sozinho vira "ativo_circulante" ou "passivo_circulante" dependendo de
-    qual cabeçalho apareceu por último.
+    "ATIVO" e "CIRCULANTE" como cabeçalhos de seção separados, cada um com
+    seu próprio total (formato de "balancete" hierárquico). E o total nem
+    sempre vem DEPOIS do rótulo na mesma linha — em documentos reais já vimos
+    o total aparecer na linha ANTERIOR ao cabeçalho seguinte (o OCR reordena
+    um pouco quando a página tem colunas/quebras estranhas). Por isso, em vez
+    de procurar só "valor depois do rótulo na mesma linha", este parser
+    trabalha sobre o texto inteiro "achatado" (sem depender de onde caem as
+    quebras de linha do OCR) e pega o valor monetário MAIS PRÓXIMO de cada
+    rótulo, seja antes ou depois dele.
     """
+    # achata quebras de linha em espaço: o OCR real já mostrou linhas
+    # quebradas de forma inconsistente, então não dá pra confiar nelas.
+    texto_flat = re.sub(r"\s+", " ", texto_pdf)
+
     encontrados = {}
-    contexto = None
+
+    # 1) localiza os cabeçalhos de seção ATIVO / PASSIVO (aceita "ATIVO:" com
+    # dois-pontos), pra saber em que contexto cada "CIRCULANTE" está.
+    marcadores = []
+    for m in re.finditer(r"\bativo\s*:?(?!\s*(n[ãa]o|circulante))\b", texto_flat, re.IGNORECASE):
+        marcadores.append((m.start(), "ativo"))
+    for m in re.finditer(r"\bpassivo\s*:?(?!\s*circulante)\b", texto_flat, re.IGNORECASE):
+        marcadores.append((m.start(), "passivo"))
+    marcadores.sort()
+
+    def contexto_em(pos):
+        atual = None
+        for p, ctx in marcadores:
+            if p <= pos:
+                atual = ctx
+            else:
+                break
+        return atual
+
+    def valor_mais_proximo(pos, janela=150):
+        ini = max(0, pos - janela)
+        trecho = texto_flat[ini: pos + janela]
+        candidatos = []
+        for vm in PADRAO_VALOR.finditer(trecho):
+            pos_abs = ini + vm.start()
+            candidatos.append((abs(pos_abs - pos), vm.group()))
+        if not candidatos:
+            return None
+        candidatos.sort(key=lambda x: x[0])
+        return candidatos[0][1]
 
     def registrar(campo, valor):
-        if campo not in encontrados:
+        if campo not in encontrados and valor:
             encontrados[campo] = _limpar_valor_ocr(valor)
 
-    for linha in texto_pdf.split("\n"):
-        s = linha.strip()
-        # troca (não remove) caracteres de ruído de OCR por espaço, senão
-        # duas palavras coladas por um caractere de ruído (ex: "ATIVO!Secao")
-        # quebram o casamento de fronteira de palavra (\b) do regex abaixo.
-        low = re.sub(r"[^\wçãõáéíóúâêôà,.\-()]", " ", s.lower())
-        low = re.sub(r"\s+", " ", low).strip()
+    # 2) "ativo total" = valor mais próximo do próprio cabeçalho ATIVO
+    marcadores_ativo = [p for p, ctx in marcadores if ctx == "ativo"]
+    if marcadores_ativo:
+        registrar("ativo_total", valor_mais_proximo(marcadores_ativo[0], janela=60))
 
-        if re.match(r"^ativo\b", low) and "circulante" not in low:
-            contexto = "ativo"
-            vals = PADRAO_VALOR.findall(s)
-            if vals:
-                registrar("ativo_total", vals[-1])
+    # 3) "não circulante" — checa o contexto (ativo/passivo) mais recente antes do rótulo
+    for m in re.finditer(r"\bn[ãa]o[\s-]*circulante\b", texto_flat, re.IGNORECASE):
+        ctx = contexto_em(m.start())
+        if ctx:
+            registrar(f"{ctx}_nao_circulante", valor_mais_proximo(m.start()))
+
+    # 4) "circulante" sozinho (não "não circulante", já tratado acima)
+    for m in re.finditer(r"\bcirculante\b", texto_flat, re.IGNORECASE):
+        prefixo = texto_flat[max(0, m.start() - 10): m.start()].lower()
+        if "não" in prefixo or "nao" in prefixo:
             continue
-        if re.match(r"^passivo\b", low) and "circulante" not in low:
-            contexto = "passivo"
-            continue
-        if contexto and re.match(r"^n[ãa]o[\s-]*circulante\b", low):
-            vals = PADRAO_VALOR.findall(s)
-            if vals:
-                registrar(f"{contexto}_nao_circulante", vals[-1])
-            continue
-        if contexto and re.match(r"^circulante\b", low):
-            vals = PADRAO_VALOR.findall(s)
-            if vals:
-                registrar(f"{contexto}_circulante", vals[-1])
-            continue
-        if re.match(r"^imobilizado\b", low):
-            vals = PADRAO_VALOR.findall(s)
-            if vals:
-                registrar("imobilizado", vals[-1])
-            continue
+        ctx = contexto_em(m.start())
+        if ctx:
+            registrar(f"{ctx}_circulante", valor_mais_proximo(m.start()))
+
+    # 5) imobilizado (não depende de contexto ativo/passivo — só existe no ativo)
+    for m in re.finditer(r"\bimobilizado\b", texto_flat, re.IGNORECASE):
+        registrar("imobilizado", valor_mais_proximo(m.start()))
+        break
 
     return encontrados
 
@@ -565,16 +614,17 @@ def validar_balanco(n):
 
 
 def validar_dre(n):
-    avisos = []
-    rl, cpv, lb = n.get("receita_liquida"), n.get("custo_produtos_servicos"), n.get("lucro_bruto")
-    if rl is not None and cpv is not None and lb is not None:
-        calc = rl + cpv if cpv < 0 else rl - cpv  # aceita CPV já negativo ou positivo
-        if abs(calc - lb) > tolerancia(rl):
-            avisos.append(
-                f"⚠️ Receita Líquida − Custo dos Produtos/Serviços ({formatar_brl(calc)}) não bate com "
-                f"o Lucro Bruto informado na DRE ({formatar_brl(lb)}). Confira os valores extraídos."
-            )
-    return avisos
+    """
+    Removida a checagem "Receita − Custo = Lucro Bruto": na prática muitas DREs
+    têm VÁRIAS linhas de custo/dedução (ex.: Custo dos Produtos Vendidos +
+    Custos de Mercadorias + Custos de Serviços, cada uma separada), e o app só
+    extrai um único campo "custo_produtos_servicos" — então essa conta dava
+    falso positivo sempre que havia mais de uma linha de custo (confirmado
+    com um caso real). Diferente do balanço patrimonial (Ativo = Passivo + PL
+    é uma identidade universal), a estrutura de custos da DRE varia demais
+    entre empresas pra validar com uma fórmula fixa sem gerar ruído.
+    """
+    return []
 
 
 # =========================================================
