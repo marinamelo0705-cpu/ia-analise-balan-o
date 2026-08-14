@@ -143,7 +143,25 @@ def extrair_texto_pdf(bytes_data, rotulo=""):
     if tabelas_texto:
         texto_pdf += "\n\n--- TABELAS DETECTADAS (linha = conta, colunas = valores) ---\n" + tabelas_texto
 
-    return texto_pdf
+    return limpar_numeros_ocr(texto_pdf)
+
+
+def limpar_numeros_ocr(texto):
+    """
+    O OCR de balanços escaneados costuma inserir espaços dentro dos próprios
+    números (ex.: "13. 474. 832,27" em vez de "13.474.832,27"). Isso já
+    confundiu a IA numa extração real: ela leu só "13.832,27", descartando o
+    grupo "474" do meio. Aqui colamos de volta apenas os espaços que estão
+    GRUDADOS a um ponto ou vírgula já existente (não inventamos separadores
+    que não estão lá, só removemos o espaço espúrio ao redor de um que já
+    existe) — isso é seguro e não junta números que são legitimamente
+    diferentes.
+    """
+    texto = re.sub(r"(?<=\d)\s+\.\s*(?=\d)", ".", texto)
+    texto = re.sub(r"(?<=\d)\s*\.\s+(?=\d)", ".", texto)
+    texto = re.sub(r"(?<=\d)\s+,\s*(?=\d)", ",", texto)
+    texto = re.sub(r"(?<=\d)\s*,\s+(?=\d)", ",", texto)
+    return texto
 
 
 def processar_pdf(bytes_data, rotulo):
@@ -277,6 +295,12 @@ Preserve o sinal exatamente como está no texto.
 
 ATENÇÃO 3: se houver mais de uma coluna de valores (ex: "Ano Atual" e
 "Ano Anterior"), utilize sempre a coluna do exercício MAIS RECENTE.
+
+ATENÇÃO 4: o texto vem de OCR e pode ter pequenos erros de espaçamento.
+Leia o número completo mesmo que ele pareça ter mais de 3 grupos de milhar
+(ex.: "13.474.832,27" tem TRÊS pontos — não descarte nenhum grupo do meio,
+copie o número inteiro do primeiro ao último dígito antes da vírgula
+decimal).
 
 --- TEXTO EXTRAÍDO DO(S) PDF(S) ---
 {texto_pdf}
@@ -455,6 +479,54 @@ def preencher_campos_faltantes(dados, texto_pdf):
             dados[campo] = valor
             recuperados.append(campo)
     return recuperados
+
+
+# =========================================================
+# ETAPA 1C: COMPLETAR POR EQUAÇÃO CONTÁBIL (quando falta só 1 peça)
+# =========================================================
+def completar_por_equacao_contabil(dados_num):
+    """
+    Ativo Total = Ativo Circulante + Ativo Não Circulante, e
+    Ativo Total = Passivo Circulante + Exigível Não Circulante + Patrimônio
+    Líquido, são identidades contábeis exatas — não são "cálculos" no
+    sentido de estimativa, são fatos que sempre valem num balanço fechado.
+    Se sobrar exatamente UMA peça faltando numa dessas equações (e as
+    outras já bateram / vieram da IA ou do fallback), preenchemos essa peça
+    por diferença em vez de deixar N/D à toa. Devolve a lista de campos
+    preenchidos assim, pra mostrar transparência ao usuário.
+    """
+    calculados = []
+
+    def preencher(campo, valor):
+        if dados_num.get(campo) is None:
+            dados_num[campo] = valor
+            calculados.append(campo)
+
+    ac, anc, at = dados_num.get("ativo_circulante"), dados_num.get("ativo_nao_circulante"), dados_num.get("ativo_total")
+    faltando_ativo = [v is None for v in (ac, anc, at)].count(True)
+    if faltando_ativo == 1:
+        if ac is None:
+            preencher("ativo_circulante", at - anc)
+        elif anc is None:
+            preencher("ativo_nao_circulante", at - ac)
+        elif at is None:
+            preencher("ativo_total", ac + anc)
+
+    # Recarrega valores (podem ter sido preenchidos acima)
+    at = dados_num.get("ativo_total")
+    pc, pnc, pl = dados_num.get("passivo_circulante"), dados_num.get("passivo_nao_circulante"), dados_num.get("patrimonio_liquido")
+    faltando_passivo = [v is None for v in (pc, pnc, pl, at)].count(True)
+    if faltando_passivo == 1:
+        if pc is None and at is not None:
+            preencher("passivo_circulante", at - (pnc or 0) - (pl or 0))
+        elif pnc is None and at is not None:
+            preencher("passivo_nao_circulante", at - (pc or 0) - (pl or 0))
+        elif pl is None and at is not None:
+            preencher("patrimonio_liquido", at - (pc or 0) - (pnc or 0))
+        elif at is None:
+            preencher("ativo_total", (pc or 0) + (pnc or 0) + (pl or 0))
+
+    return calculados
 
 
 # =========================================================
@@ -723,9 +795,18 @@ if pdf_balanco and groq_api_key:
             )
 
         dados_num = {c: parse_valor_brl(dados.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
+
+        calculados = completar_por_equacao_contabil(dados_num)
+        if calculados:
+            st.caption(
+                "🧮 Estes campos não vieram no texto — foram calculados por diferença "
+                "contábil (Ativo = Passivo + PL, e Ativo = Circulante + Não Circulante): "
+                + ", ".join(calculados)
+            )
+
         # dados_brl é sempre derivado de dados_num (float já parseado), nunca da string crua da IA
         # ou do regex — assim o formato exibido é sempre consistente ("R$ 1.234,56" / "-R$ ..." / "N/D"),
-        # não importa se o valor veio da IA ou do fallback.
+        # não importa se o valor veio da IA, do fallback ou foi calculado por diferença.
         dados_brl = {c: formatar_brl(dados_num.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
         dados_brl["resultado_tipo"] = dados.get("resultado_tipo") or "não identificado"
         dados_brl["resultado_dre_tipo"] = dados.get("resultado_dre_tipo") or "não identificado"
