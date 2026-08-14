@@ -1,12 +1,13 @@
+import io
 import json
 import re
 
 import streamlit as st
+import plotly.graph_objects as go
 from groq import Groq
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_bytes
-from PIL import Image
 
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -15,9 +16,17 @@ st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊",
 
 st.title("📊 Analisador Contábil de Balanços e DRE")
 st.caption(
-    "Envie o PDF do Balanço Patrimonial (e, se tiver, a DRE) para extrair os valores, "
-    "conferir a saúde financeira da empresa e identificar prejuízos."
+    "Envie o PDF do Balanço Patrimonial (e, se tiver, a DRE em arquivo separado) para "
+    "extrair os valores, conferir a saúde financeira da empresa e identificar prejuízos."
 )
+
+# Paleta (dataviz skill) — cores fixas por papel, nunca por ordem/ciclo.
+COR_CIRCULANTE = "#2a78d6"       # azul — slot categórico 1
+COR_NAO_CIRCULANTE = "#1baf7a"   # aqua — slot categórico 3
+COR_PL = "#4a3aa7"                # violeta — slot categórico 7 (entidade própria)
+COR_BOM = "#0ca30c"               # status "good"
+COR_CRITICO = "#d03b3b"           # status "critical"
+COR_SUPERFICIE = "#fcfcfb"
 
 # =========================================================
 # API KEY
@@ -28,36 +37,45 @@ else:
     groq_api_key = st.sidebar.text_input("Insira sua API Key da Groq (Grátis):", type="password")
 st.sidebar.info("Pegue sua chave gratuita em: https://console.groq.com/")
 
-MODELO = "llama-3.3-70b-versatile"  # confira em console.groq.com/docs/models se este nome ainda está disponível
+MODELO = "llama-3.3-70b-versatile"  # confira em console.groq.com/docs/models se ainda está disponível
 
 
 # =========================================================
 # EXTRAÇÃO DE TEXTO DO PDF
 # =========================================================
-def extrair_texto_pdf(pdf_file):
+LIMIAR_TEXTO_PAGINA = 40  # abaixo disso, a página é considerada "sem texto direto"
+
+
+def extrair_texto_pdf(bytes_data, rotulo=""):
     """
-    Extrai texto preservando o layout de colunas (Ativo x Passivo lado a lado),
-    e complementa com uma leitura estruturada de tabelas quando disponível.
-    Isso evita que o valor do Passivo Circulante seja lido como se fosse
-    o Ativo Circulante (e vice-versa) quando as duas colunas do balanço
-    são "achatadas" em uma única linha de texto sem noção de posição.
+    Extrai texto página por página, preservando o layout de colunas (Ativo x
+    Passivo lado a lado) e complementando com leitura estruturada de tabelas.
+
+    IMPORTANTE: o OCR é decidido POR PÁGINA, não pelo documento inteiro. Em
+    balanços reais é comum uma página ter texto digital normal (ex.: o lado
+    do Passivo) e outra ser uma imagem/scan (ex.: o lado do Ativo, ou uma
+    página assinada digitalizada). Se a decisão de usar OCR fosse tomada só
+    pelo total de caracteres do documento, uma página com bastante texto
+    "esconde" a página vazia — e essa página inteira simplesmente some do
+    texto final, fazendo a IA devolver N/D para tudo que estava nela. Por
+    isso cada página abaixo do limiar recebe OCR individualmente.
     """
-    texto_pdf = ""
+    texto_paginas = []
+    paginas_para_ocr = []
     tabelas_texto = ""
 
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
+    with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+        for i, page in enumerate(pdf.pages):
             # layout=True preserva os espaços em branco de acordo com a posição
-            # x/y original do PDF, o que mantém as colunas do balanço alinhadas
-            # em vez de misturar Ativo e Passivo numa única sequência de números.
-            t = page.extract_text(layout=True)
-            if t:
-                texto_pdf += t + "\n"
+            # x/y original do PDF, mantendo as colunas alinhadas em vez de
+            # misturar Ativo e Passivo numa única sequência de números.
+            t = page.extract_text(layout=True) or ""
+            if len(t.strip()) < LIMIAR_TEXTO_PAGINA:
+                paginas_para_ocr.append(i)
+                texto_paginas.append("")  # preenchido abaixo via OCR
+            else:
+                texto_paginas.append(t)
 
-            # Tentativa adicional: extrair tabelas de forma estruturada.
-            # Quando o PDF tem grade/tabela real, isso dá ao modelo uma
-            # visão "linha = conta, coluna = valor" muito mais confiável
-            # do que o texto corrido.
             try:
                 tabelas = page.extract_tables()
                 for tabela in tabelas:
@@ -68,67 +86,108 @@ def extrair_texto_pdf(pdf_file):
             except Exception:
                 pass
 
+    if paginas_para_ocr:
+        numeros = ", ".join(str(p + 1) for p in paginas_para_ocr)
+        st.info(f"ℹ️ {rotulo}: página(s) {numeros} com pouco texto digital — aplicando OCR nelas individualmente...")
+        for i in paginas_para_ocr:
+            try:
+                imgs = convert_from_bytes(bytes_data, dpi=300, first_page=i + 1, last_page=i + 1)
+                texto_ocr = ""
+                for img in imgs:
+                    texto_ocr += pytesseract.image_to_string(img.convert("L"), lang="por", config="--psm 4") + "\n"
+                texto_paginas[i] = texto_ocr
+            except Exception as e:
+                st.warning(f"Não foi possível aplicar OCR na página {i + 1} de {rotulo}: {e}")
+
+    texto_pdf = "\n".join(f"--- página {i + 1} ---\n{t}" for i, t in enumerate(texto_paginas))
     if tabelas_texto:
         texto_pdf += "\n\n--- TABELAS DETECTADAS (linha = conta, colunas = valores) ---\n" + tabelas_texto
 
     return texto_pdf
 
 
-def extrair_texto_ocr(bytes_data):
-    """
-    Fallback para PDFs escaneados/fotografados. Usa DPI mais alto (300) para
-    melhorar a legibilidade de números pequenos e --psm 4 (texto organizado
-    em colunas/blocos verticais), que tende a preservar melhor a ordem de
-    leitura de balanços do que --psm 6 (bloco único de texto).
-    """
-    images = convert_from_bytes(bytes_data, dpi=300)
-    texto_pdf = ""
-    for img in images:
-        img_gray = img.convert("L")
-        texto_ocr = pytesseract.image_to_string(img_gray, lang="por", config="--psm 4")
-        texto_pdf += texto_ocr + "\n"
-    return texto_pdf
+def processar_pdf(bytes_data, rotulo):
+    texto = extrair_texto_pdf(bytes_data, rotulo)
+    if len(texto.strip()) < 30:
+        st.error(f"⚠️ Não foi possível reconhecer o texto do documento «{rotulo}». Verifique se a imagem está legível.")
+        return None
+    return texto
 
 
 # =========================================================
 # HELPERS DE NÚMERO / JSON
 # =========================================================
 def parse_valor_brl(valor_str):
-    """Converte 'R$ 21.966.947,43' ou '21.966.947,43' em float 21966947.43."""
+    """
+    Converte 'R$ 21.966.947,43', '(1.234,56)' (negativo entre parênteses) ou
+    '-1.234,56' em float. Retorna None se não houver valor.
+    """
     if valor_str is None:
         return None
-    s = str(valor_str)
-    s = re.sub(r"[^0-9,.\-]", "", s)
-    if s in ("", "-", None):
+    s = str(valor_str).strip()
+    if not s or s.lower() in ("null", "none", "n/d", "nd"):
         return None
+
+    negativo = "(" in s and ")" in s
+    if s.lstrip().startswith("-"):
+        negativo = True
+
+    s = re.sub(r"[^0-9,.\-]", "", s)
     s = s.replace(".", "").replace(",", ".")
+    if s in ("", "-", "."):
+        return None
     try:
-        return float(s)
+        valor = float(s)
     except ValueError:
         return None
+    return -abs(valor) if negativo else valor
 
 
 def formatar_brl(valor):
     if valor is None:
         return "N/D"
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    sinal = "-" if valor < 0 else ""
+    return f"{sinal}R$ {abs(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def escapar_dolar(texto):
+    """
+    Escapa 'R$' antes de mandar pro st.markdown. Versões recentes do Streamlit
+    interpretam um único '$' como abertura de fórmula LaTeX/MathJax; quando o
+    texto tem duas ou mais ocorrências de 'R$', tudo entre elas pode virar
+    matemática e corromper o texto (foi o que gerou aquele "R`" estranho em
+    vez de "R$" no seu resultado). Escapando, o cifrão volta a ser só texto.
+    """
+    if not texto:
+        return texto
+    return texto.replace("R$", "R\\$")
 
 
 def extrair_json_da_resposta(texto):
-    """
-    Extrai o primeiro bloco JSON válido da resposta do modelo, mesmo que ele
-    venha cercado de texto ou de ```json ... ```.
-    """
+    """Extrai o primeiro bloco JSON válido, mesmo cercado de texto ou ```json```."""
     match = re.search(r"\{.*\}", texto, re.DOTALL)
     if not match:
         raise ValueError("Nenhum JSON encontrado na resposta do modelo.")
     return json.loads(match.group(0))
 
 
+def chamada_groq_segura(client, prompt, temperature=0.1):
+    """Encapsula a chamada à API com tratamento de erro amigável."""
+    try:
+        resp = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=MODELO,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content, None
+    except Exception as e:
+        return None, str(e)
+
+
 # =========================================================
 # ETAPA 1: EXTRAÇÃO ESTRUTURADA (JSON) — SEM TEXTO LIVRE
 # =========================================================
-CAMPOS_ESPERADOS = [
+CAMPOS_BALANCO = [
     "ativo_circulante",
     "ativo_nao_circulante",
     "imobilizado",
@@ -140,25 +199,44 @@ CAMPOS_ESPERADOS = [
     "prejuizos_acumulados",
 ]
 
+CAMPOS_DRE = [
+    "receita_liquida",
+    "custo_produtos_servicos",
+    "lucro_bruto",
+    "despesas_operacionais",
+    "resultado_financeiro",
+    "resultado_antes_ir",
+    "ir_csll",
+    "resultado_liquido_dre",
+]
+
+CAMPOS_ESPERADOS = CAMPOS_BALANCO + CAMPOS_DRE + ["resultado_tipo", "resultado_dre_tipo"]
+
 PROMPT_EXTRACAO = """
-Você é um auditor contábil sênior extraindo dados de um Balanço Patrimonial e/ou DRE.
-Analise APENAS os dados explícitos contidos no texto abaixo. NÃO calcule, NÃO invente
-e NÃO estime nenhum valor — copie exatamente o número que está escrito no texto ao lado
-de cada conta contábil.
+Você é um auditor contábil sênior extraindo dados de um Balanço Patrimonial e,
+se houver, de uma DRE (Demonstração do Resultado do Exercício). Analise APENAS
+os dados explícitos contidos no texto abaixo. NÃO calcule, NÃO invente e NÃO
+estime nenhum valor — copie exatamente o número escrito ao lado de cada conta.
 
-ATENÇÃO: balanços patrimoniais brasileiros normalmente têm DUAS colunas lado a lado —
-o ATIVO (esquerda) e o PASSIVO + PATRIMÔNIO LÍQUIDO (direita). Preste muita atenção
-para não confundir "Ativo Circulante" com "Passivo Circulante", nem "Ativo Não Circulante"
-com "Passivo Não Circulante" — são contas diferentes que costumam aparecer na mesma
-altura da página, em colunas diferentes. Use os rótulos exatos do texto para decidir a
-qual conta cada valor pertence.
+ATENÇÃO 1: balanços patrimoniais brasileiros normalmente têm DUAS colunas lado
+a lado — o ATIVO (esquerda) e o PASSIVO + PATRIMÔNIO LÍQUIDO (direita). Preste
+muita atenção para não confundir "Ativo Circulante" com "Passivo Circulante",
+nem "Ativo Não Circulante" com "Passivo Não Circulante" — são contas diferentes
+que costumam aparecer na mesma altura da página, em colunas diferentes.
 
---- TEXTO EXTRAÍDO DO PDF ---
+ATENÇÃO 2: valores entre parênteses, como (1.234,56), ou precedidos de sinal
+de menos representam números NEGATIVOS (ex: prejuízo, despesas, deduções).
+Preserve o sinal exatamente como está no texto.
+
+ATENÇÃO 3: se houver mais de uma coluna de valores (ex: "Ano Atual" e
+"Ano Anterior"), utilize sempre a coluna do exercício MAIS RECENTE.
+
+--- TEXTO EXTRAÍDO DO(S) PDF(S) ---
 {texto_pdf}
 -----------------------------
 
-Responda SOMENTE com um JSON válido (sem markdown, sem texto antes ou depois), no
-formato abaixo. Se um valor não existir explicitamente no texto, use null.
+Responda SOMENTE com um JSON válido (sem markdown, sem texto antes ou depois),
+no formato abaixo. Se um valor não existir explicitamente no texto, use null.
 
 {{
   "ativo_circulante": "valor exatamente como está escrito, ex: 21.966.947,43",
@@ -168,88 +246,254 @@ formato abaixo. Se um valor não existir explicitamente no texto, use null.
   "passivo_circulante": "...",
   "passivo_nao_circulante": "... (Exigível Não Circulante)",
   "patrimonio_liquido": "...",
-  "resultado_exercicio": "... (valor do lucro ou prejuízo do exercício)",
+  "resultado_exercicio": "... (lucro ou prejuízo do exercício, conforme consta no Balanço/PL)",
   "resultado_tipo": "lucro" ou "prejuizo" ou null,
-  "prejuizos_acumulados": "..."
+  "prejuizos_acumulados": "...",
+
+  "receita_liquida": "... (só se houver DRE no texto)",
+  "custo_produtos_servicos": "...",
+  "lucro_bruto": "...",
+  "despesas_operacionais": "...",
+  "resultado_financeiro": "...",
+  "resultado_antes_ir": "...",
+  "ir_csll": "...",
+  "resultado_liquido_dre": "... (resultado líquido final da DRE)",
+  "resultado_dre_tipo": "lucro" ou "prejuizo" ou null
 }}
 """
 
 
 def extrair_dados_estruturados(client, texto_pdf):
-    resp = client.chat.completions.create(
-        messages=[{"role": "user", "content": PROMPT_EXTRACAO.format(texto_pdf=texto_pdf)}],
-        model=MODELO,
-        temperature=0.1,
-    )
-    dados = extrair_json_da_resposta(resp.choices[0].message.content)
+    conteudo, erro = chamada_groq_segura(client, PROMPT_EXTRACAO.format(texto_pdf=texto_pdf), temperature=0.1)
+    if erro:
+        raise RuntimeError(f"Falha ao chamar a API da Groq na extração dos dados: {erro}")
+    try:
+        dados = extrair_json_da_resposta(conteudo)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"O modelo não retornou um JSON válido na extração dos dados ({e}). "
+            f"Tente processar novamente — respostas de IA podem variar."
+        )
     for campo in CAMPOS_ESPERADOS:
         dados.setdefault(campo, None)
     return dados
 
 
 # =========================================================
+# ETAPA 1B: EXTRAÇÃO DE SEGURANÇA VIA REGEX (rede de proteção contra N/D)
+# =========================================================
+# Se a IA devolver null para um campo, tentamos achar o valor "na marra" com
+# regex direto no texto extraído, antes de desistir e mostrar N/D. Isso cobre
+# tanto falhas de leitura do modelo quanto rótulos que ele não reconheceu.
+PADRAO_VALOR = re.compile(r"\(?-?\s?R?\$?\s?\d{1,3}(?:\.\d{3})*,\d{2}\)?")
+
+ROTULOS_FALLBACK = {
+    "ativo_circulante": r"ativo\s+circulante",
+    "ativo_nao_circulante": r"ativo\s+n[ãa]o[\s-]*circulante",
+    "imobilizado": r"imobilizado(?!s)",
+    "ativo_total": r"(ativo\s+total|total\s+do\s+ativo)",
+    "passivo_circulante": r"passivo\s+circulante",
+    "passivo_nao_circulante": r"(passivo\s+n[ãa]o[\s-]*circulante|exig[íi]vel\s*(a\s*longo\s*prazo|n[ãa]o[\s-]*circulante)?)",
+    "patrimonio_liquido": r"patrim[oô]nio\s+l[íi]quido",
+    "prejuizos_acumulados": r"preju[íi]zos?\s+acumulados?",
+    "resultado_exercicio": r"(resultado\s+do\s+exerc[íi]cio|lucro[s]?\s*/?\s*preju[íi]zo[s]?\s+(l[íi]quido\s+)?(do\s+)?exerc[íi]cio)",
+    "receita_liquida": r"receita\s+l[íi]quida",
+    "custo_produtos_servicos": r"custo\s+(dos?\s+)?(produtos?|mercadorias?|servi[çc]os?)",
+    "lucro_bruto": r"lucro\s+bruto",
+    "despesas_operacionais": r"despesas?\s+operacionais?",
+    "resultado_financeiro": r"resultado\s+financeiro",
+    "resultado_antes_ir": r"resultado\s+antes\s+(do\s+)?(ir|imposto)",
+    "ir_csll": r"(ir\s*/?\s*csll|imposto\s+de\s+renda)",
+    "resultado_liquido_dre": r"(resultado|lucro)\s+l[íi]quido\s+(do\s+)?exerc[íi]cio",
+}
+
+
+def extrair_fallback_regex(texto_pdf):
+    """Varre o texto linha a linha e casa rótulo + valor monetário na mesma linha."""
+    encontrados = {}
+    linhas = texto_pdf.split("\n")
+    for campo, padrao_rotulo in ROTULOS_FALLBACK.items():
+        regex_rotulo = re.compile(padrao_rotulo, re.IGNORECASE)
+        for linha in linhas:
+            m = regex_rotulo.search(linha)
+            if not m:
+                continue
+            valores = PADRAO_VALOR.findall(linha[m.end():])
+            if valores:
+                encontrados[campo] = valores[0].strip()
+                break
+    return encontrados
+
+
+def preencher_campos_faltantes(dados, texto_pdf):
+    """Completa com o fallback regex qualquer campo que a IA deixou null, e devolve a lista dos que foram recuperados assim."""
+    fallback = extrair_fallback_regex(texto_pdf)
+    recuperados = []
+    for campo, valor in fallback.items():
+        if not dados.get(campo) and campo in CAMPOS_BALANCO + CAMPOS_DRE:
+            dados[campo] = valor
+            recuperados.append(campo)
+    return recuperados
+
+
+# =========================================================
 # ETAPA 2: VALIDAÇÃO ARITMÉTICA (CONFERE SE OS NÚMEROS BATEM)
 # =========================================================
-def validar_balanco(dados_num):
+def tolerancia(base):
+    """Tolerância relativa (0,5% do valor de referência), com piso de R$ 5."""
+    if base is None:
+        return 5.0
+    return max(5.0, abs(base) * 0.005)
+
+
+def validar_balanco(n):
     avisos = []
-
-    ac = dados_num.get("ativo_circulante")
-    anc = dados_num.get("ativo_nao_circulante")
-    at = dados_num.get("ativo_total")
-    pc = dados_num.get("passivo_circulante")
-    pnc = dados_num.get("passivo_nao_circulante")
-    pl = dados_num.get("patrimonio_liquido")
-
-    TOL = 5.0  # tolerância de arredondamento em R$
+    ac, anc, at = n.get("ativo_circulante"), n.get("ativo_nao_circulante"), n.get("ativo_total")
+    pc, pnc, pl = n.get("passivo_circulante"), n.get("passivo_nao_circulante"), n.get("patrimonio_liquido")
 
     if ac is not None and anc is not None and at is not None:
-        soma_ativo = ac + anc
-        if abs(soma_ativo - at) > TOL:
+        soma = ac + anc
+        if abs(soma - at) > tolerancia(at):
             avisos.append(
-                f"⚠️ Ativo Circulante + Ativo Não Circulante ({formatar_brl(soma_ativo)}) "
-                f"não bate com o Ativo Total informado ({formatar_brl(at)}). "
-                f"Confira os valores extraídos com o PDF original."
+                f"⚠️ Ativo Circulante + Ativo Não Circulante ({formatar_brl(soma)}) não bate com o "
+                f"Ativo Total informado ({formatar_brl(at)}). Confira os valores com o PDF original."
             )
 
     if pc is not None and pnc is not None and pl is not None and at is not None:
-        soma_passivo = pc + pnc + pl
-        if abs(soma_passivo - at) > TOL:
+        soma = pc + pnc + pl
+        if abs(soma - at) > tolerancia(at):
             avisos.append(
-                f"⚠️ Passivo Circulante + Exigível Não Circulante + Patrimônio Líquido "
-                f"({formatar_brl(soma_passivo)}) não bate com o Ativo Total "
-                f"({formatar_brl(at)}). Pela equação contábil (Ativo = Passivo + PL), "
-                f"esses valores deveriam ser iguais — pode indicar erro de extração."
+                f"⚠️ Passivo Circulante + Exigível Não Circulante + Patrimônio Líquido ({formatar_brl(soma)}) "
+                f"não bate com o Ativo Total ({formatar_brl(at)}). Pela equação contábil "
+                f"(Ativo = Passivo + PL), esses valores deveriam ser iguais — pode indicar erro de extração."
             )
 
     return avisos
 
 
+def validar_dre(n):
+    avisos = []
+    rl, cpv, lb = n.get("receita_liquida"), n.get("custo_produtos_servicos"), n.get("lucro_bruto")
+    if rl is not None and cpv is not None and lb is not None:
+        calc = rl + cpv if cpv < 0 else rl - cpv  # aceita CPV já negativo ou positivo
+        if abs(calc - lb) > tolerancia(rl):
+            avisos.append(
+                f"⚠️ Receita Líquida − Custo dos Produtos/Serviços ({formatar_brl(calc)}) não bate com "
+                f"o Lucro Bruto informado na DRE ({formatar_brl(lb)}). Confira os valores extraídos."
+            )
+    return avisos
+
+
 # =========================================================
-# ETAPA 3: DIAGNÓSTICO E RECOMENDAÇÕES (usa os números já validados)
+# ETAPA 3: INDICADORES FINANCEIROS
+# =========================================================
+def calcular_indicadores(n):
+    ac, pc = n.get("ativo_circulante"), n.get("passivo_circulante")
+    pnc, pl, at = n.get("passivo_nao_circulante"), n.get("patrimonio_liquido"), n.get("ativo_total")
+    ind = {}
+
+    if ac is not None and pc not in (None, 0):
+        ind["liquidez_corrente"] = ac / pc
+
+    divida_total = (pc or 0) + (pnc or 0) if (pc is not None or pnc is not None) else None
+    if divida_total is not None and at not in (None, 0):
+        ind["endividamento_geral"] = divida_total / at
+
+    if divida_total is not None and pl not in (None, 0):
+        ind["capital_terceiros_sobre_pl"] = divida_total / pl
+
+    ind["pl_negativo"] = pl is not None and pl < 0
+    return ind
+
+
+# =========================================================
+# ETAPA 4: GRÁFICOS (paleta e regras do dataviz skill)
+# =========================================================
+def grafico_composicao(titulo, segmentos):
+    """
+    Barra horizontal única (100% empilhada) mostrando a composição de um
+    grupo (ex.: Ativo, ou Passivo + PL). `segmentos` é uma lista de
+    (rótulo, valor, cor). Valores None/negativos indevidos são ignorados.
+    """
+    segmentos_validos = [(r, v, c) for r, v, c in segmentos if v is not None and v > 0]
+    if not segmentos_validos:
+        return None
+
+    fig = go.Figure()
+    for rotulo, valor, cor in segmentos_validos:
+        fig.add_trace(
+            go.Bar(
+                y=[titulo],
+                x=[valor],
+                name=rotulo,
+                orientation="h",
+                marker=dict(color=cor, line=dict(color=COR_SUPERFICIE, width=2)),
+                text=[formatar_brl(valor)],
+                textposition="inside",
+                insidetextanchor="middle",
+                hovertemplate=f"<b>{rotulo}</b><br>%{{text}}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        barmode="stack",
+        title=titulo,
+        height=180,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.4),
+        xaxis=dict(showgrid=True, gridcolor="#e1e0d9", title="R$"),
+        yaxis=dict(showticklabels=False),
+        plot_bgcolor=COR_SUPERFICIE,
+        paper_bgcolor=COR_SUPERFICIE,
+    )
+    return fig
+
+
+# =========================================================
+# ETAPA 5: DIAGNÓSTICO E RECOMENDAÇÕES (usa números já validados)
 # =========================================================
 PROMPT_DIAGNOSTICO = """
 Você é um auditor contábil sênior. Os valores abaixo já foram extraídos e conferidos
-do balanço — use-os exatamente como estão, não os recalcule nem os altere.
+— use-os exatamente como estão, não os recalcule nem os altere.
 
-- Ativo Circulante: R$ {ativo_circulante}
-- Ativo Não Circulante: R$ {ativo_nao_circulante}
-- Imobilizado: R$ {imobilizado}
-- Ativo Total: R$ {ativo_total}
-- Passivo Circulante: R$ {passivo_circulante}
-- Exigível Não Circulante: R$ {passivo_nao_circulante}
-- Patrimônio Líquido: R$ {patrimonio_liquido}
-- Resultado do Exercício: R$ {resultado_exercicio} ({resultado_tipo})
-- Prejuízos Acumulados: R$ {prejuizos_acumulados}
+DADOS DO BALANÇO
+- Ativo Circulante: {ativo_circulante}
+- Ativo Não Circulante: {ativo_nao_circulante}
+- Imobilizado: {imobilizado}
+- Ativo Total: {ativo_total}
+- Passivo Circulante: {passivo_circulante}
+- Exigível Não Circulante: {passivo_nao_circulante}
+- Patrimônio Líquido: {patrimonio_liquido}
+- Resultado do Exercício: {resultado_exercicio} ({resultado_tipo})
+- Prejuízos Acumulados: {prejuizos_acumulados}
 
-Escreva em Markdown, com estas duas seções:
+DADOS DA DRE (se disponíveis; ignore se todos forem N/D)
+- Receita Líquida: {receita_liquida}
+- Custo dos Produtos/Serviços: {custo_produtos_servicos}
+- Lucro Bruto: {lucro_bruto}
+- Despesas Operacionais: {despesas_operacionais}
+- Resultado Financeiro: {resultado_financeiro}
+- Resultado antes do IR/CSLL: {resultado_antes_ir}
+- IR/CSLL: {ir_csll}
+- Resultado Líquido da DRE: {resultado_liquido_dre} ({resultado_dre_tipo})
+
+INDICADORES JÁ CALCULADOS
+- Liquidez Corrente: {liquidez_corrente}
+- Endividamento Geral: {endividamento_geral}
+- Capital de Terceiros / Patrimônio Líquido: {capital_terceiros_sobre_pl}
+- Patrimônio Líquido negativo (passivo a descoberto)? {pl_negativo}
+
+Escreva em Markdown, com estas seções:
 
 ### 📈 Resultado e Prejuízos
-Explique se a empresa teve lucro ou prejuízo no exercício, de quanto foi, e comente
-os prejuízos acumulados, se houver.
+Diga claramente se a empresa teve lucro ou prejuízo no exercício, de quanto foi, e
+comente os prejuízos acumulados, se houver. Se houver dados de DRE, explique também
+o resultado operacional (receita, custos, despesas) que levou a esse resultado.
 
 ### 💡 Diagnóstico Financeiro e Ideias de Ação
-- **Análise da Saúde Financeira:** 2 parágrafos avaliando liquidez, endividamento e
-  se o Patrimônio Líquido está positivo ou negativo, com base nos números acima.
+- **Análise da Saúde Financeira:** 2 parágrafos avaliando liquidez, nível de
+  endividamento e se o Patrimônio Líquido está positivo ou negativo, com base nos
+  números e indicadores acima.
 - **Ideias e Recomendações Práticas:** de 3 a 5 sugestões práticas para a diretoria.
 
 Sempre que citar um valor monetário, destaque-o em amarelo usando:
@@ -257,86 +501,196 @@ Sempre que citar um valor monetário, destaque-o em amarelo usando:
 """
 
 
-def gerar_diagnostico(client, dados_brl):
-    prompt = PROMPT_DIAGNOSTICO.format(**dados_brl)
-    resp = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model=MODELO,
-        temperature=0.2,
+def gerar_diagnostico(client, dados_brl, indicadores):
+    contexto = dict(dados_brl)
+    contexto["liquidez_corrente"] = (
+        f"{indicadores['liquidez_corrente']:.2f}" if "liquidez_corrente" in indicadores else "N/D"
     )
-    return resp.choices[0].message.content
+    contexto["endividamento_geral"] = (
+        f"{indicadores['endividamento_geral']:.1%}" if "endividamento_geral" in indicadores else "N/D"
+    )
+    contexto["capital_terceiros_sobre_pl"] = (
+        f"{indicadores['capital_terceiros_sobre_pl']:.2f}" if "capital_terceiros_sobre_pl" in indicadores else "N/D"
+    )
+    contexto["pl_negativo"] = "SIM ⚠️" if indicadores.get("pl_negativo") else "Não"
+
+    prompt = PROMPT_DIAGNOSTICO.format(**contexto)
+    conteudo, erro = chamada_groq_segura(client, prompt, temperature=0.2)
+    if erro:
+        st.error(f"Falha ao gerar o diagnóstico: {erro}")
+        return "_Não foi possível gerar o diagnóstico. Os valores extraídos acima continuam válidos._"
+    return conteudo
 
 
 # =========================================================
-# MONTAGEM DA SEÇÃO DE ESTRUTURA (Python puro, sem risco de o modelo trocar valores)
+# MONTAGEM DAS SEÇÕES EM PYTHON (sem risco de a IA trocar valores)
 # =========================================================
-def montar_secao_estrutura(dados_brl):
-    def destaque(v):
-        return f'<span style="color: #F1C40F; font-weight: bold;">R$ {v}</span>' if v and v != "None" else "N/D"
+def destaque(v):
+    """v já vem formatado (ex: 'R$ 1.234,56', '-R$ 1.234,56' ou 'N/D') via formatar_brl()."""
+    return f'<span style="color: #F1C40F; font-weight: bold;">{v}</span>' if v and v != "N/D" else "N/D"
 
+
+def montar_secao_balanco(b):
     return f"""
 ### 1. 🏢 Estrutura do Ativo
 
-* **Ativo Circulante:** {destaque(dados_brl['ativo_circulante'])}
-* **Ativo Não Circulante:** {destaque(dados_brl['ativo_nao_circulante'])}
-* **Imobilizado (dentro do Não Circulante):** {destaque(dados_brl['imobilizado'])}
-* **Ativo Total:** {destaque(dados_brl['ativo_total'])}
+* **Ativo Circulante:** {destaque(b['ativo_circulante'])}
+* **Ativo Não Circulante:** {destaque(b['ativo_nao_circulante'])}
+* **Imobilizado (dentro do Não Circulante):** {destaque(b['imobilizado'])}
+* **Ativo Total:** {destaque(b['ativo_total'])}
 
 ### 2. 💳 Estrutura do Passivo e Patrimônio Líquido
 
-* **Passivo Circulante:** {destaque(dados_brl['passivo_circulante'])}
-* **Exigível Não Circulante (Passivo Não Circulante):** {destaque(dados_brl['passivo_nao_circulante'])}
-* **Patrimônio Líquido:** {destaque(dados_brl['patrimonio_liquido'])}
+* **Passivo Circulante:** {destaque(b['passivo_circulante'])}
+* **Exigível Não Circulante (Passivo Não Circulante):** {destaque(b['passivo_nao_circulante'])}
+* **Patrimônio Líquido:** {destaque(b['patrimonio_liquido'])}
+"""
+
+
+def montar_secao_dre(b):
+    if all(b.get(c, "N/D") == "N/D" for c in CAMPOS_DRE):
+        return ""
+    return f"""
+### 📄 Demonstração do Resultado do Exercício (DRE)
+
+* **Receita Líquida:** {destaque(b['receita_liquida'])}
+* **Custo dos Produtos/Serviços Vendidos:** {destaque(b['custo_produtos_servicos'])}
+* **Lucro Bruto:** {destaque(b['lucro_bruto'])}
+* **Despesas Operacionais:** {destaque(b['despesas_operacionais'])}
+* **Resultado Financeiro:** {destaque(b['resultado_financeiro'])}
+* **Resultado antes do IR/CSLL:** {destaque(b['resultado_antes_ir'])}
+* **IR/CSLL:** {destaque(b['ir_csll'])}
+* **Resultado Líquido do Exercício (DRE):** {destaque(b['resultado_liquido_dre'])}
 """
 
 
 # =========================================================
 # FLUXO PRINCIPAL
 # =========================================================
-pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
+col1, col2 = st.columns(2)
+with col1:
+    pdf_balanco = st.file_uploader("📁 Balanço Patrimonial (obrigatório)", type=["pdf"])
+with col2:
+    pdf_dre = st.file_uploader("📁 DRE — Demonstração do Resultado (opcional, se for um arquivo separado)", type=["pdf"])
 
-if pdf_file and groq_api_key:
+if pdf_balanco and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
-        bytes_data = pdf_file.getvalue()
-
-        texto_pdf = extrair_texto_pdf(pdf_file)
-
-        if len(texto_pdf.strip()) < 50:
-            st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem...")
-            texto_pdf = extrair_texto_ocr(bytes_data)
-
-        if len(texto_pdf.strip()) < 30:
-            st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
+        texto_balanco = processar_pdf(pdf_balanco.getvalue(), "Balanço Patrimonial")
+        if texto_balanco is None:
             st.stop()
+
+        texto_completo = texto_balanco
+        if pdf_dre is not None:
+            texto_dre = processar_pdf(pdf_dre.getvalue(), "DRE")
+            if texto_dre:
+                texto_completo += "\n\n--- DOCUMENTO DA DRE ---\n" + texto_dre
 
         client = Groq(api_key=groq_api_key)
 
         with st.spinner("Extraindo valores do balanço..."):
-            dados = extrair_dados_estruturados(client, texto_pdf)
+            try:
+                dados = extrair_dados_estruturados(client, texto_completo)
+            except RuntimeError as e:
+                st.error(str(e))
+                st.stop()
 
-        # versões numéricas (para validar) e versões em texto (para exibir)
-        dados_num = {campo: parse_valor_brl(dados.get(campo)) for campo in CAMPOS_ESPERADOS}
-        dados_brl = {campo: (dados.get(campo) if dados.get(campo) else "N/D") for campo in CAMPOS_ESPERADOS}
+        recuperados = preencher_campos_faltantes(dados, texto_completo)
+        if recuperados:
+            st.caption(
+                "🔎 Estes campos vieram null da IA e foram recuperados por leitura direta do texto: "
+                + ", ".join(recuperados)
+            )
+
+        dados_num = {c: parse_valor_brl(dados.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
+        # dados_brl é sempre derivado de dados_num (float já parseado), nunca da string crua da IA
+        # ou do regex — assim o formato exibido é sempre consistente ("R$ 1.234,56" / "-R$ ..." / "N/D"),
+        # não importa se o valor veio da IA ou do fallback.
+        dados_brl = {c: formatar_brl(dados_num.get(c)) for c in CAMPOS_BALANCO + CAMPOS_DRE}
         dados_brl["resultado_tipo"] = dados.get("resultado_tipo") or "não identificado"
+        dados_brl["resultado_dre_tipo"] = dados.get("resultado_dre_tipo") or "não identificado"
 
-        avisos = validar_balanco(dados_num)
+        avisos = validar_balanco(dados_num) + validar_dre(dados_num)
         if avisos:
             st.warning(
-                "Encontrei uma inconsistência entre os valores extraídos. "
-                "Isso costuma acontecer quando o PDF tem colunas lado a lado (Ativo x Passivo) "
-                "e o texto extraído embaralha a ordem. Revise os valores abaixo com atenção "
-                "antes de usar o relatório:"
+                "Encontrei inconsistências nos valores extraídos. Isso costuma acontecer quando o PDF "
+                "tem colunas lado a lado (Ativo x Passivo) e o texto extraído embaralha a ordem. "
+                "Revise com atenção antes de usar o relatório:"
             )
             for aviso in avisos:
-                st.markdown(aviso)
+                st.markdown(escapar_dolar(aviso))
         else:
-            st.success("✅ Ativo Total e Passivo + Patrimônio Líquido batem — valores consistentes.")
+            st.success("✅ Os totais extraídos são consistentes entre si (Ativo = Passivo + PL).")
 
-        st.markdown(montar_secao_estrutura(dados_brl), unsafe_allow_html=True)
+        indicadores = calcular_indicadores(dados_num)
+
+        # --- Resumo rápido (métricas) ---
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Ativo Total", formatar_brl(dados_num.get("ativo_total")))
+        with m2:
+            resultado_val = dados_num.get("resultado_exercicio")
+            st.metric(
+                "Resultado do Exercício",
+                formatar_brl(resultado_val),
+                delta=None if resultado_val is None else ("Lucro" if resultado_val >= 0 else "Prejuízo"),
+                delta_color="normal" if (resultado_val is None or resultado_val >= 0) else "inverse",
+            )
+        with m3:
+            liq = indicadores.get("liquidez_corrente")
+            st.metric("Liquidez Corrente", f"{liq:.2f}" if liq is not None else "N/D")
+
+        if indicadores.get("pl_negativo"):
+            st.markdown(
+                f'<span style="color:{COR_CRITICO}; font-weight:bold;">⚠️ Patrimônio Líquido negativo '
+                f'(passivo a descoberto) — a empresa deve mais do que possui.</span>',
+                unsafe_allow_html=True,
+            )
+
+        # --- Gráficos de composição ---
+        g1, g2 = st.columns(2)
+        fig_ativo = grafico_composicao(
+            "Ativo",
+            [
+                ("Ativo Circulante", dados_num.get("ativo_circulante"), COR_CIRCULANTE),
+                ("Ativo Não Circulante", dados_num.get("ativo_nao_circulante"), COR_NAO_CIRCULANTE),
+            ],
+        )
+        fig_passivo = grafico_composicao(
+            "Passivo + Patrimônio Líquido",
+            [
+                ("Passivo Circulante", dados_num.get("passivo_circulante"), COR_CIRCULANTE),
+                ("Exigível Não Circulante", dados_num.get("passivo_nao_circulante"), COR_NAO_CIRCULANTE),
+                ("Patrimônio Líquido", dados_num.get("patrimonio_liquido"), COR_PL),
+            ],
+        )
+        if fig_ativo:
+            g1.plotly_chart(fig_ativo, use_container_width=True)
+        if fig_passivo:
+            g2.plotly_chart(fig_passivo, use_container_width=True)
+
+        # --- Seções detalhadas ---
+        secao_balanco = montar_secao_balanco(dados_brl)
+        secao_dre = montar_secao_dre(dados_brl)
+        st.markdown(escapar_dolar(secao_balanco), unsafe_allow_html=True)
+        if secao_dre:
+            st.markdown(escapar_dolar(secao_dre), unsafe_allow_html=True)
 
         with st.spinner("Gerando diagnóstico..."):
-            diagnostico = gerar_diagnostico(client, dados_brl)
-        st.markdown(diagnostico, unsafe_allow_html=True)
+            diagnostico = gerar_diagnostico(client, dados_brl, indicadores)
+        st.markdown(escapar_dolar(diagnostico), unsafe_allow_html=True)
+
+        # --- Download do relatório completo ---
+        relatorio_md = escapar_dolar(
+            f"# Relatório de Análise Contábil\n\n{secao_balanco}\n{secao_dre}\n{diagnostico}"
+        )
+        st.download_button(
+            "⬇️ Baixar relatório em Markdown",
+            data=relatorio_md.encode("utf-8"),
+            file_name="relatorio_analise_contabil.md",
+            mime="text/markdown",
+        )
 
         with st.expander("🔍 Ver texto extraído do PDF (para conferência manual)"):
-            st.text(texto_pdf)
+            st.text(texto_completo)
+elif not groq_api_key:
+    st.info("Insira sua API Key da Groq na barra lateral para começar.")
