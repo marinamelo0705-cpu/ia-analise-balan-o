@@ -613,6 +613,55 @@ def validar_balanco(n):
     return avisos
 
 
+def sugerir_correcao_ativo(dados_num):
+    """
+    Quando Ativo Circulante + Ativo Não Circulante não bate com o Ativo Total,
+    mas o lado do Passivo (Passivo Circulante + Exigível Não Circulante + PL)
+    bate exatamente com o Ativo Total, isso confirma que o Ativo Total está
+    correto — então um dos dois componentes do Ativo (Circulante ou Não
+    Circulante) está errado (normalmente por erro de OCR truncando dígitos), e
+    o OUTRO determina o valor certo por diferença: at - anc ou at - ac.
+
+    Para decidir QUAL dos dois está errado, comparamos a ordem de grandeza de
+    cada um com o Passivo Circulante (numa empresa em operação normal, o Ativo
+    Circulante costuma ser da mesma ordem de grandeza do Passivo Circulante) —
+    o que estiver desproporcionalmente menor que o valor corrigido é o suspeito.
+
+    Retorna um dict {"campo": ..., "valor_sugerido": ..., "valor_extraido": ...}
+    ou None se não houver base segura para sugerir nada.
+    """
+    ac = dados_num.get("ativo_circulante")
+    anc = dados_num.get("ativo_nao_circulante")
+    at = dados_num.get("ativo_total")
+    pc = dados_num.get("passivo_circulante")
+    pnc = dados_num.get("passivo_nao_circulante")
+    pl = dados_num.get("patrimonio_liquido")
+
+    if None in (ac, anc, at):
+        return None
+    if abs((ac + anc) - at) <= tolerancia(at):
+        return None  # já bate, nada a sugerir
+
+    # só confia no Ativo Total como âncora se o lado do Passivo bater com ele
+    if None in (pc, pnc, pl):
+        return None
+    if abs((pc + pnc + pl) - at) > tolerancia(at):
+        return None  # o próprio total está suspeito, não dá pra usar como âncora
+
+    ac_alt = at - anc
+    anc_alt = at - ac
+
+    # heurística: o candidato "errado" é o que está desproporcionalmente menor
+    # que a referência de mesma ordem de grandeza (Passivo Circulante / ac_alt)
+    if pc and pc > 0 and ac_alt > 0 and ac < ac_alt * 0.05:
+        return {"campo": "ativo_circulante", "valor_sugerido": ac_alt, "valor_extraido": ac}
+
+    if anc_alt > 0 and ac > 0 and anc < ac_alt * 0.02:
+        return {"campo": "ativo_nao_circulante", "valor_sugerido": anc_alt, "valor_extraido": anc}
+
+    return None
+
+
 def validar_dre(n):
     """
     Removida a checagem "Receita − Custo = Lucro Bruto": na prática muitas DREs
@@ -818,6 +867,9 @@ with col2:
 
 if pdf_balanco and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
+        st.session_state["processar"] = True
+
+    if st.session_state.get("processar"):
         texto_balanco = processar_pdf(pdf_balanco.getvalue(), "Balanço Patrimonial")
         if texto_balanco is None:
             st.stop()
@@ -853,6 +905,28 @@ if pdf_balanco and groq_api_key:
                 "contábil (Ativo = Passivo + PL, e Ativo = Circulante + Não Circulante): "
                 + ", ".join(calculados)
             )
+
+        sugestao = sugerir_correcao_ativo(dados_num)
+        if sugestao:
+            nome_campo = "Ativo Circulante" if sugestao["campo"] == "ativo_circulante" else "Ativo Não Circulante"
+            st.markdown(escapar_dolar(
+                f"🔧 **Possível correção automática encontrada.** O valor extraído de **{nome_campo}** "
+                f"({formatar_brl(sugestao['valor_extraido'])}) não bate com o Ativo Total, mas o Passivo + PL "
+                f"confirma que o Ativo Total ({formatar_brl(dados_num.get('ativo_total'))}) está correto. "
+                f"Isso costuma acontecer quando o OCR lê dígitos como letras num PDF escaneado. Pela diferença "
+                f"algébrica, o valor correto de {nome_campo} deveria ser "
+                f"**{formatar_brl(sugestao['valor_sugerido'])}**."
+            ))
+            aplicar_correcao = st.checkbox(
+                f"✅ Aplicar o valor sugerido para {nome_campo} ({formatar_brl(sugestao['valor_sugerido'])})",
+                key="aplicar_correcao_ativo",
+            )
+            if aplicar_correcao:
+                dados_num[sugestao["campo"]] = sugestao["valor_sugerido"]
+                st.caption(
+                    f"↪️ Aplicado: {nome_campo} ajustado para {formatar_brl(sugestao['valor_sugerido'])} "
+                    "(valor calculado por diferença contábil, não extraído diretamente do PDF — confira com o original)."
+                )
 
         # dados_brl é sempre derivado de dados_num (float já parseado), nunca da string crua da IA
         # ou do regex — assim o formato exibido é sempre consistente ("R$ 1.234,56" / "-R$ ..." / "N/D"),
