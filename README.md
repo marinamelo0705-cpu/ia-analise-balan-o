@@ -1,39 +1,55 @@
 # 📊 Analisador Inteligente de Balanços e DRE
 
-Aplicação em Streamlit que lê um PDF contábil (Balanço Patrimonial / DRE), extrai os dados via texto nativo ou OCR, e usa um modelo de IA (via Groq) para gerar um diagnóstico financeiro estruturado.
+Aplicação em Streamlit que lê um PDF contábil (Balanço Patrimonial / DRE), extrai o texto (nativo ou via OCR) e usa IA (Groq) para retornar apenas os indicadores financeiros principais, já calculados e destacados.
 
 ## 🚀 Demo
 
 Hospedado em: [Streamlit Community Cloud](https://share.streamlit.io/)
 
-## ✨ Funcionalidades
+## ✨ O que o app retorna
 
-- Upload de PDF de Balanço/DRE
-- Extração de texto nativo (via `pdfplumber`) com fallback automático para **OCR** (via `pytesseract`) quando o PDF é digitalizado/escaneado
-- Pré-processamento de imagem (contraste, nitidez, binarização) para melhorar a precisão do OCR em documentos escaneados
-- Análise via IA (Groq API) com relatório estruturado em 4 seções:
-  1. Estrutura do Ativo
-  2. Estrutura do Passivo e Patrimônio Líquido
-  3. Resultado e Prejuízos
-  4. Diagnóstico Financeiro e Recomendações
-- Destaque visual (amarelo) para todos os valores monetários
-- Expander com o texto bruto extraído, para conferência manual dos números
+A resposta é sempre uma lista objetiva, sem parágrafos ou recomendações, com estes 10 itens:
+
+1. **Ativo Circulante**
+2. **Ativo Não Circulante**
+3. **Ativo Total**
+4. **Imobilizado**
+5. **Passivo Circulante**
+6. **Exigível Não Circulante**
+7. **Patrimônio Líquido**
+8. **Capital de Giro Líquido** (calculado como Ativo Circulante − Passivo Circulante)
+9. **Resultado do Exercício** (Lucro ou Prejuízo do período, identificado automaticamente)
+10. **Prejuízos Acumulados**
+
+Todos os valores monetários aparecem destacados em amarelo no relatório.
+
+## ⚙️ Como funciona a extração
+
+1. O PDF é lido página por página com `pdfplumber`.
+2. Se uma página não tiver texto digital suficiente (documento escaneado/foto), ela é:
+   - renderizada em 400 DPI (`pdf2image`);
+   - pré-processada com **OpenCV** (desfoque de mediana + binarização Otsu) para remover marcas d'água e ruído de fundo que atrapalham a leitura dos números;
+   - lida via **Tesseract OCR** (idioma português).
+3. O texto final (nativo + OCR) é enviado para o modelo de IA na Groq, com instruções estritas para não inventar valores e não arredondar dígitos.
+4. O relatório final é exibido com os valores destacados em amarelo.
 
 ## 🛠️ Tecnologias
 
 - [Streamlit](https://streamlit.io/) — interface web
 - [Groq](https://console.groq.com/) — inferência de IA (modelo `openai/gpt-oss-120b`)
 - [pdfplumber](https://github.com/jsvine/pdfplumber) — extração de texto nativo de PDF
-- [pytesseract](https://github.com/madmaze/pytesseract) + [pdf2image](https://github.com/Belval/pdf2image) — OCR para PDFs escaneados
-- [Pillow (PIL)](https://python-pillow.org/) — pré-processamento de imagem
+- [pytesseract](https://github.com/madmaze/pytesseract) + [pdf2image](https://github.com/Belval/pdf2image) — OCR para páginas escaneadas
+- [OpenCV](https://opencv.org/) (`opencv-python-headless`) — pré-processamento de imagem (remoção de ruído/marca d'água, binarização Otsu)
+- [Pillow (PIL)](https://python-pillow.org/) — manipulação de imagem
+- [NumPy](https://numpy.org/) — suporte ao processamento de imagem com OpenCV
 
 ## 📦 Instalação local
 
-### Pré-requisitos
+### Pré-requisitos de sistema
 
 - Python 3.9+
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) instalado no sistema (com o pacote de idioma português `por`)
-- [Poppler](https://poppler.freedesktop.org/) instalado no sistema (necessário para o `pdf2image`)
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) com o pacote de idioma português (`por`)
+- [Poppler](https://poppler.freedesktop.org/) (necessário para o `pdf2image`)
 
 **Linux (Debian/Ubuntu):**
 ```bash
@@ -62,7 +78,7 @@ pip install -r requirements.txt
 ```toml
 GROQ_API_KEY = "sua_chave_aqui"
 ```
-Ou insira a chave diretamente na barra lateral ao rodar o app (a chave gratuita pode ser obtida em [console.groq.com](https://console.groq.com/)).
+Ou insira a chave diretamente na barra lateral ao rodar o app (chave gratuita em [console.groq.com](https://console.groq.com/)).
 
 4. Rode a aplicação:
 ```bash
@@ -71,37 +87,10 @@ streamlit run app.py
 
 ## ☁️ Deploy no Streamlit Community Cloud
 
-1. Faça fork/push deste repositório para o GitHub.
+1. Faça push deste repositório para o GitHub.
 2. Acesse [share.streamlit.io](https://share.streamlit.io/) e conecte o repositório.
 3. Em **Settings → Secrets**, adicione:
 ```toml
 GROQ_API_KEY = "sua_chave_aqui"
 ```
-4. Adicione um arquivo `packages.txt` na raiz do repositório com as dependências de sistema (Tesseract e Poppler), já que o Streamlit Cloud roda em ambiente Linux:
-```
-tesseract-ocr
-tesseract-ocr-por
-poppler-utils
-```
-5. O deploy é automático a cada `git push` na branch `main`.
-
-## 📄 requirements.txt (sugerido)
-
-```
-streamlit
-groq
-pdfplumber
-pytesseract
-pdf2image
-pillow
-```
-
-## ⚠️ Notas importantes
-
-- A precisão da leitura depende diretamente da qualidade do scan/foto do PDF enviado. Documentos nítidos, sem inclinação e com boa resolução geram resultados muito mais confiáveis.
-- O app usa o modelo `openai/gpt-oss-120b` via Groq. Caso a Groq descontinue esse modelo no futuro, atualize a variável `model` na chamada `client.chat.completions.create()` em `app.py` (consulte [console.groq.com/docs/models](https://console.groq.com/docs/models) para a lista atualizada).
-- Use sempre o expander "🔍 Ver texto bruto extraído do PDF" para conferir se um valor divergente veio de um erro de OCR ou de leitura da IA.
-
-## 📝 Licença
-
-Defina a licença do projeto aqui (ex: MIT).
+4. Adicione um arquivo `packages.txt` na raiz do repositório com as dependências de sistema (o Streamlit Cloud roda em Linux):
