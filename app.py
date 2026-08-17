@@ -1,3 +1,4 @@
+import sys
 import io
 import streamlit as st
 from groq import Groq
@@ -7,6 +8,14 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import numpy as np
 import cv2
+
+# Garante que a saída padrão use UTF-8, evitando erros de codificação com
+# emojis/acentos quando o app roda em ambientes com locale ASCII (comum
+# no Windows ou em alguns provedores de hospedagem restritos)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
