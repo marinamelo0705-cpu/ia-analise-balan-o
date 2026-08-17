@@ -89,8 +89,10 @@ if pdf_file and groq_api_key:
                 imagens_b64 = []
                 if paginas_escaneadas:
                     st.info(f"ℹ️ {len(paginas_escaneadas)} página(s) escaneada(s)/fotografada(s) detectada(s). Serão analisadas diretamente por IA de visão, sem OCR.")
-                    # Limite da API: no máximo 5 imagens por requisição
-                    for i in paginas_escaneadas[:5]:
+                    if len(paginas_escaneadas) > 3:
+                        st.warning(f"⚠️ O modelo de visão só processa até 3 imagens por análise. Apenas as páginas {paginas_escaneadas[:3]} serão lidas; as demais ({paginas_escaneadas[3:]}) serão ignoradas nesta análise.")
+                    # Limite da API: no máximo 3 imagens por requisição
+                    for i in paginas_escaneadas[:3]:
                         pagina_imgs = convert_from_bytes(bytes_data, dpi=250, first_page=i, last_page=i)
                         for img in pagina_imgs:
                             imagens_b64.append(imagem_para_base64(img))
