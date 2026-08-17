@@ -58,6 +58,8 @@ def extrair_resultado_exercicio(texto):
     Exercício na DRE. Esse valor é copiado direto do texto reconhecido pelo OCR, sem
     passar pela reescrita da IA — evita o erro de transcrição de dígito que a IA pode
     cometer ao reformatar números longos em meio a um texto grande.
+    Retorna uma string tipo "Lucro Líquido do Exercício: R$ 793.376,08" ou None se
+    não encontrar o padrão no texto.
     """
     padrao = re.compile(
         r'(LUCRO\s+L[IÍ]QUIDO|PREJU[IÍ]ZO\s+L[IÍ]QUIDO|PREJU[IÍ]ZO)\s+DO\s+EXERC[IÍ]CIO'
@@ -80,25 +82,23 @@ if pdf_file and groq_api_key:
                 texto_pdf = ""
 
                 # 1. Extração página a página: cada página é avaliada individualmente.
-                #    Isso evita o problema de PDFs "mistos" (algumas páginas com texto
-                #    digital e outras escaneadas) — se o documento inteiro tivesse texto
-                #    suficiente no total, páginas escaneadas isoladas eram ignoradas.
                 with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
                     for i, page in enumerate(pdf.pages, start=1):
                         t = page.extract_text()
                         if t and len(t.strip()) >= 20:
                             texto_pdf += t + "\n"
                         else:
-                            # Página escaneada/imagem: renderiza em 400 dpi, pré-processa
-                            # (remove marca d'água) e roda OCR uma única vez por página
-                            # (leitura dupla estourava o limite de tokens/minuto do
-                            # tier gratuito da Groq).
                             st.info(f"ℹ️ Página {i} parece escaneada/fotografada. Aplicando OCR com tratamento de imagem...")
                             imagens_pagina = convert_from_bytes(bytes_data, dpi=400, first_page=i, last_page=i)
                             for img in imagens_pagina:
                                 img_tratada = preparar_imagem_para_ocr(img)
-                                texto_ocr = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
-                                texto_pdf += texto_ocr + "\n"
+                                # Duas leituras com modos de segmentação diferentes: psm 6
+                                # (bloco único) e psm 4 (colunas) — juntas dão mais chance
+                                # de acertar números que o psm 6 às vezes funde com o rótulo.
+                                texto_psm6 = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
+                                texto_psm4 = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 4')
+                                texto_pdf += f"\n--- Página {i} (leitura A) ---\n{texto_psm6}\n"
+                                texto_pdf += f"\n--- Página {i} (leitura B, mesma página, outro modo de OCR) ---\n{texto_psm4}\n"
 
                 # Trava de segurança final
                 if len(texto_pdf.strip()) < 30:
@@ -122,7 +122,9 @@ if pdf_file and groq_api_key:
                 prompt = f"""
 Você é um auditor contábil sênior. Analise APENAS os dados explícitos contidos no texto abaixo.
 O texto veio de OCR de um documento escaneado, então pode conter pequenos erros de leitura
-(pontos e vírgulas trocados, algum caractere confundido, ou um dígito borrado).
+(pontos e vírgulas trocados, algum caractere confundido, ou um dígito borrado). Quando houver
+duas leituras da mesma página (leitura A e leitura B), compare as duas e escolha o valor mais
+coerente com o contexto contábil.
 
 REGRAS IMPORTANTES SOBRE VALORES:
 - NÃO escreva "Não informado no documento" para um subtotal (ex: Imobilizado, Ativo Total) só
@@ -132,7 +134,7 @@ REGRAS IMPORTANTES SOBRE VALORES:
   Por exemplo: Ativo Não Circulante = Créditos e Valores + Investimento + Imobilizado + Bens
   Intangíveis. Se três dessas parcelas estiverem legíveis e o subtotal total também, calcule a
   quarta por subtração ao invés de responder "não informado".
-- Só escreva "Não informado no documento" se o rótulo da conta realmente não aparecer em nenhum
+- Só escreva "Não informado no documento" se o rótulo da conta realmente não aparecer em nenhuma
   lugar do texto (não porque um dígito ficou difícil de ler).
 - Nunca invente uma conta ou valor que não tenha nenhuma base no texto.
 
@@ -171,12 +173,10 @@ Forneça um relatório em Markdown altamente estruturado contendo exatamente as 
                     messages=[{"role": "user", "content": prompt}],
                     model="openai/gpt-oss-120b",
                     temperature=0.1,
-                    max_tokens=2048,
+                    max_tokens=4096,
                 )
 
                 # 3. Exibição do relatório final.
-                # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
-                # o que causava a renderização quebrada ("R`" no lugar de "R$").
                 conteudo = response.choices[0].message.content
                 conteudo_seguro = conteudo.replace("$", "\\$")
 
