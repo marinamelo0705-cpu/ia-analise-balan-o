@@ -37,7 +37,6 @@ if pdf_file and groq_api_key:
                 # 2. Se o PDF for escaneado, aplica OCR otimizado
                 if len(texto_pdf.strip()) < 50:
                     st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem...")
-                    # DPI mais alto = dígitos mais nítidos = menos troca de números pelo OCR
                     images = convert_from_bytes(bytes_data, dpi=300)
                     texto_pdf = ""
                     for img in images:
@@ -50,7 +49,7 @@ if pdf_file and groq_api_key:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 3. Envio para a Groq (Llama 3.3) usando tags HTML para a cor amarela
+                # 3. Envio para a Groq usando tags HTML para a cor amarela
                 client = Groq(api_key=groq_api_key)
 
                 prompt = f"""
@@ -95,7 +94,7 @@ Forneça um relatório em Markdown altamente estruturado contendo exatamente as 
 
                 response = client.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
+                    model="openai/gpt-oss-120b",
                     temperature=0.1
                 )
 
