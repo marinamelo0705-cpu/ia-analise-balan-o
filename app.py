@@ -1,14 +1,17 @@
+import io
 import streamlit as st
 from groq import Groq
 import pdfplumber
+import pytesseract
 from pdf2image import convert_from_bytes
-import base64
-import io
+from PIL import Image
+import numpy as np
+import cv2
 
 # Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
 st.title("📊 Analisador Inteligente de Balanços e DRE")
-st.markdown("Suba o arquivo PDF contábil da empresa para gerar o diagnóstico estruturado de Ativos, Passivos, Resultado e Recomendações.")
+st.markdown("Suba o arquivo PDF contábil da empresa para extrair Ativo, Passivo, Patrimônio Líquido, Resultado e Capital de Giro.")
 
 # Busca a chave salva nos Secrets do Streamlit ou pede na barra lateral
 if "GROQ_API_KEY" in st.secrets:
@@ -20,103 +23,113 @@ else:
 # Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
 
-INSTRUCOES_ANALISE = """
-Você é um auditor contábil sênior. Analise APENAS os dados explícitos contidos no documento (texto ou imagem abaixo).
 
-REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
-1. Dê sempre um espaço entre os títulos/textos e os valores numéricos.
-2. DESTAQUE EM AMARELO TODOS OS VALORES NUMÉRICOS E DE MOEDA EM REAIS. Para destacar em amarelo, envolva OBRIGATORIAMENTE o valor na tag HTML: <span style="color: #F1C40F; font-weight: bold;">R$ VALOR</span>.
-3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas.
-
-REGRAS OBRIGATÓRIAS DE PRECISÃO NUMÉRICA (MUITO IMPORTANTE):
-4. Leia cada número dígito por dígito, com atenção total. NUNCA arredonde, corrija ou "adivinhe" um valor. Se um número tiver muitos dígitos, releia antes de responder.
-5. Localize a ÚLTIMA ocorrência de cada rótulo (ex: "LUCRO LÍQUIDO DO EXERCÍCIO"), pois normalmente é o valor totalizado/oficial da linha final da demonstração.
-6. Contas como "Imobilizado", "Investimentos" e "Intangível" costumam estar DENTRO do Ativo Não Circulante. Procure essas linhas no documento inteiro antes de dizer "não informado".
-7. Só escreva "não informado" se o rótulo realmente não aparecer em NENHUM lugar do documento, mesmo de forma abreviada. Antes de concluir isso, procure variações como "ATIVO CIRC", "TOTAL DO ATIVO", "ATIVO TOTAL" etc.
-8. Se um valor numérico tiver 6 dígitos ou mais, cite entre parênteses e aspas o trecho exato (linha) de onde ele foi retirado, logo após o valor, para conferência.
-
-Forneça um relatório em Markdown altamente estruturado contendo exatamente as seções abaixo:
-
-### 1. 🏢 ESTRUTURA DO ATIVO
-* **Ativo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-* **Ativo Não Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-* **Imobilizado (dentro do Não Circulante):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-* **Ativo Total:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-
-### 2. 💳 ESTRUTURA DO PASSIVO E PATRIMÔNIO LÍQUIDO
-* **Passivo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-* **Exigível Não Circulante (Passivo Não Circulante):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-* **Patrimônio Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
-
-### 3. 📈 RESULTADO E PREJUÍZOS
-* **Resultado do Exercício (Ano):** [Informe se teve Lucro ou Prejuízo com valor em <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>]
-* **Prejuízos Acumulados:** [Informe o valor exato da conta Prejuízos Acumulados em <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>]
-
-### 4. 💡 DIAGNÓSTICO FINANCEIRO E IDEIAS DE AÇÃO
-* **Análise da Saúde Financeira:** [Resumo em 2 parágrafos destacando os principais valores em amarelo]
-* **Ideias e Recomendações Práticas:** [3 a 5 sugestões práticas para a diretoria]
-"""
-
-
-def imagem_para_base64(img) -> str:
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+def preparar_imagem_para_ocr(imagem_pil):
+    """
+    Pré-processa a imagem escaneada antes do OCR:
+    - converte pra tons de cinza
+    - aplica median blur pra atenuar marcas d'água / textura de fundo (hachurados finos)
+    - binariza com threshold automático (Otsu), deixando o texto preto puro
+      sobre fundo branco puro — isso melhora muito a leitura do Tesseract em
+      documentos escaneados com ruído/marca d'água sobre a tabela.
+    """
+    arr = np.array(imagem_pil.convert('L'))
+    arr = cv2.medianBlur(arr, 3)
+    _, arr_bin = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return Image.fromarray(arr_bin)
 
 
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
-        with st.spinner("Lendo documento e analisando (pode levar alguns segundos)..."):
+        with st.spinner("Lendo documento e extraindo dados (pode levar alguns segundos se for escaneado)..."):
             try:
                 bytes_data = pdf_file.read()
                 texto_pdf = ""
 
-                # 1. Tentativa de extração direta via pdfplumber (PDF digital/nativo)
-                with pdfplumber.open(pdf_file) as pdf:
-                    for page in pdf.pages:
+                # 1. Extração página a página: cada página é avaliada individualmente.
+                #    Isso evita o problema de PDFs "mistos" (algumas páginas com texto
+                #    digital e outras escaneadas) — se o documento inteiro tivesse texto
+                #    suficiente no total, páginas escaneadas isoladas eram ignoradas.
+                with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+                    for i, page in enumerate(pdf.pages, start=1):
                         t = page.extract_text()
-                        if t:
+                        if t and len(t.strip()) >= 20:
                             texto_pdf += t + "\n"
+                        else:
+                            # Página sem texto digital suficiente: escaneada/imagem.
+                            # Renderiza em alta resolução (400 dpi) e pré-processa
+                            # antes do OCR — resolve o problema de marcas d'água /
+                            # texturas de fundo que atrapalham a leitura dos números.
+                            st.info(f"ℹ️ Página {i} parece escaneada/fotografada. Aplicando OCR com tratamento de imagem...")
+                            imagens_pagina = convert_from_bytes(bytes_data, dpi=400, first_page=i, last_page=i)
+                            for img in imagens_pagina:
+                                img_tratada = preparar_imagem_para_ocr(img)
+                                texto_ocr = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
+                                texto_pdf += texto_ocr + "\n"
 
+                # Trava de segurança final
+                if len(texto_pdf.strip()) < 30:
+                    st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
+                    st.stop()
+
+                # 2. Envio para a Groq (GPT-OSS 120B) usando tags HTML para a cor amarela
                 client = Groq(api_key=groq_api_key)
 
-                if len(texto_pdf.strip()) >= 50:
-                    # PDF nativo: manda o texto direto (mais barato e rápido)
-                    prompt_completo = f"{INSTRUCOES_ANALISE}\n\n--- TEXTO EXTRAÍDO DO PDF ---\n{texto_pdf}\n-----------------------------"
-                    response = client.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt_completo}],
-                        model="openai/gpt-oss-120b",
-                        temperature=0.1
-                    )
-                else:
-                    # PDF escaneado/foto: manda a IMAGEM direto pro modelo com visão (sem OCR)
-                    st.info("ℹ️ PDF escaneado/fotografado detectado. Analisando as páginas com IA de visão (sem depender de OCR)...")
-                    images = convert_from_bytes(bytes_data, dpi=300)
-                    images = images[:5]  # limite da API: máx. 5 imagens por requisição
+                prompt = f"""
+Você é um auditor contábil sênior. Analise APENAS os dados explícitos contidos no texto abaixo.
+O texto veio de OCR de um documento escaneado, então pode conter pequenos erros de leitura
+(ex: pontos e vírgulas trocados, algum caractere confundido). Use o contexto contábil e as
+regras conhecidas de balanço (Ativo = Passivo + Patrimônio Líquido) para interpretar os
+valores mais prováveis quando um número parecer inconsistente, mas NUNCA invente uma conta
+ou valor que não exista no texto.
 
-                    conteudo = [{"type": "text", "text": INSTRUCOES_ANALISE}]
-                    for img in images:
-                        img_b64 = imagem_para_base64(img)
-                        conteudo.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                        })
+REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
+1. Dê sempre um espaço entre os títulos/textos e os valores numéricos.
+2. DESTAQUE EM AMARELO TODOS OS VALORES NUMÉRICOS E DE MOEDA EM REAIS. Para destacar em amarelo, envolva OBRIGATORIAMENTE o valor na tag HTML: <span style="color: #F1C40F; font-weight: bold;">R$ VALOR</span>. Nunca escreva "R$" fora dessa tag.
+3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais. Se um valor realmente não constar no texto, escreva "Não informado no documento" ao invés de inventar.
+4. NÃO escreva parágrafos, diagnóstico, análise ou recomendações. A resposta deve conter APENAS a lista de itens abaixo, nada além disso.
+5. Calcule o Capital de Giro Líquido como: Ativo Circulante − Passivo Circulante. Mostre a conta feita entre parênteses.
+6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício (linha "LUCRO LÍQUIDO DO EXERCÍCIO" ou "PREJUÍZO DO EXERCÍCIO") e rotule corretamente.
 
-                    response = client.chat.completions.create(
-                        messages=[{"role": "user", "content": conteudo}],
-                        model="qwen/qwen3.6-27b",
-                        temperature=0.1
-                    )
+--- TEXTO EXTRAÍDO DO PDF ---
+{texto_pdf}
+-----------------------------
 
-                # 2. Exibição do relatório final (unsafe_allow_html=True permite o HTML amarelo)
+Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
+
+### 📊 RESULTADO DA ANÁLISE
+
+* **Ativo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Ativo Não Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Ativo Total:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Imobilizado:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Passivo Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Exigível Não Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Patrimônio Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Capital de Giro Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span> (Ativo Circulante − Passivo Circulante)
+* **Resultado do Exercício (Lucro ou Prejuízo):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Prejuízos Acumulados:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+"""
+
+                response = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="openai/gpt-oss-120b",
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+
+                # 3. Exibição do relatório final.
+                # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
+                # o que causava a renderização quebrada ("R`" no lugar de "R$").
+                conteudo = response.choices[0].message.content
+                conteudo_seguro = conteudo.replace("$", "\\$")
+
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
-                st.markdown(response.choices[0].message.content, unsafe_allow_html=True)
+                st.markdown(conteudo_seguro, unsafe_allow_html=True)
 
-                # 3. Se foi extração por texto, mostra o texto bruto para conferência
-                if len(texto_pdf.strip()) >= 50:
-                    with st.expander("🔍 Ver texto bruto extraído do PDF (para conferência)"):
-                        st.text(texto_pdf)
+                with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
+                    st.text(texto_pdf)
 
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
