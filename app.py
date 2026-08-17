@@ -1,12 +1,9 @@
-import io
 import streamlit as st
 from groq import Groq
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
-import numpy as np
-import cv2
 
 # Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
@@ -23,22 +20,6 @@ else:
 # Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
 
-
-def preparar_imagem_para_ocr(imagem_pil):
-    """
-    Pré-processa a imagem escaneada antes do OCR:
-    - converte pra tons de cinza
-    - aplica median blur pra atenuar marcas d'água / textura de fundo (hachurados finos)
-    - binariza com threshold automático (Otsu), deixando o texto preto puro
-      sobre fundo branco puro — isso melhora muito a leitura do Tesseract em
-      documentos escaneados com ruído/marca d'água sobre a tabela.
-    """
-    arr = np.array(imagem_pil.convert('L'))
-    arr = cv2.medianBlur(arr, 3)
-    _, arr_bin = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return Image.fromarray(arr_bin)
-
-
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
         with st.spinner("Lendo documento e extraindo dados (pode levar alguns segundos se for escaneado)..."):
@@ -46,47 +27,45 @@ if pdf_file and groq_api_key:
                 bytes_data = pdf_file.read()
                 texto_pdf = ""
 
-                # 1. Extração página a página: cada página é avaliada individualmente.
-                #    Isso evita o problema de PDFs "mistos" (algumas páginas com texto
-                #    digital e outras escaneadas) — se o documento inteiro tivesse texto
-                #    suficiente no total, páginas escaneadas isoladas eram ignoradas.
-                with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
-                    for i, page in enumerate(pdf.pages, start=1):
+                # 1. Tentativa de extração direta via pdfplumber
+                with pdfplumber.open(pdf_file) as pdf:
+                    for page in pdf.pages:
                         t = page.extract_text()
-                        if t and len(t.strip()) >= 20:
+                        if t:
                             texto_pdf += t + "\n"
-                        else:
-                            # Página sem texto digital suficiente: escaneada/imagem.
-                            # Renderiza em alta resolução (400 dpi) e pré-processa
-                            # antes do OCR — resolve o problema de marcas d'água /
-                            # texturas de fundo que atrapalham a leitura dos números.
-                            st.info(f"ℹ️ Página {i} parece escaneada/fotografada. Aplicando OCR com tratamento de imagem...")
-                            imagens_pagina = convert_from_bytes(bytes_data, dpi=400, first_page=i, last_page=i)
-                            for img in imagens_pagina:
-                                img_tratada = preparar_imagem_para_ocr(img)
-                                texto_ocr = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
-                                texto_pdf += texto_ocr + "\n"
+
+                # 2. Se o PDF for escaneado, aplica OCR otimizado
+                if len(texto_pdf.strip()) < 50:
+                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem...")
+                    # DPI mais alto = dígitos mais nítidos = menos troca de números pelo OCR
+                    images = convert_from_bytes(bytes_data, dpi=300)
+                    texto_pdf = ""
+                    for img in images:
+                        img_gray = img.convert('L')
+                        texto_ocr = pytesseract.image_to_string(img_gray, lang="por", config='--psm 6')
+                        texto_pdf += texto_ocr + "\n"
 
                 # Trava de segurança final
                 if len(texto_pdf.strip()) < 30:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 2. Envio para a Groq (GPT-OSS 120B) usando tags HTML para a cor amarela
+                # 3. Envio para a Groq (Llama 3.3) usando tags HTML para a cor amarela
                 client = Groq(api_key=groq_api_key)
 
                 prompt = f"""
 Você é um auditor contábil sênior. Analise APENAS os dados explícitos contidos no texto abaixo.
-O texto veio de OCR de um documento escaneado, então pode conter pequenos erros de leitura
-(ex: pontos e vírgulas trocados, algum caractere confundido). Use o contexto contábil e as
-regras conhecidas de balanço (Ativo = Passivo + Patrimônio Líquido) para interpretar os
-valores mais prováveis quando um número parecer inconsistente, mas NUNCA invente uma conta
-ou valor que não exista no texto.
 
 REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 1. Dê sempre um espaço entre os títulos/textos e os valores numéricos.
-2. DESTAQUE EM AMARELO TODOS OS VALORES NUMÉRICOS E DE MOEDA EM REAIS, inclusive dentro de parágrafos corridos (não só nos tópicos). Para destacar em amarelo, envolva OBRIGATORIAMENTE o valor na tag HTML: <span style="color: #F1C40F; font-weight: bold;">R$ VALOR</span>. Nunca escreva "R$" fora dessa tag.
-3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais. Se um valor realmente não constar no texto, escreva "Não informado no documento" ao invés de inventar.
+2. DESTAQUE EM AMARELO TODOS OS VALORES NUMÉRICOS E DE MOEDA EM REAIS. Para destacar em amarelo, envolva OBRIGATORIAMENTE o valor na tag HTML: <span style="color: #F1C40F; font-weight: bold;">R$ VALOR</span>.
+3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais.
+
+REGRAS OBRIGATÓRIAS DE PRECISÃO NUMÉRICA (MUITO IMPORTANTE):
+4. NUNCA arredonde, corrija ou "adivinhe" um valor numérico. Copie os dígitos EXATAMENTE como aparecem no texto extraído, incluindo pontos e vírgulas.
+5. Antes de responder, releia o texto extraído e localize a ÚLTIMA ocorrência de cada rótulo (ex: "LUCRO LÍQUIDO DO EXERCÍCIO", "PREJUÍZO DO EXERCÍCIO"), pois normalmente é o valor totalizado/oficial da linha final da demonstração.
+6. Contas como "Imobilizado", "Investimentos" e "Intangível" costumam estar DENTRO do Ativo Não Circulante, mesmo que não apareçam isoladas no topo do documento. Procure essas linhas no corpo do texto inteiro antes de dizer "não informado".
+7. Se um valor numérico tiver 6 dígitos ou mais, cite entre parênteses e aspas o trecho exato (linha) de onde ele foi retirado do texto extraído, logo após o valor, para conferência. Exemplo: <span style="color: #F1C40F; font-weight: bold;">R$ 793.376,08</span> ("LUCRO LÍQUIDO DO EXERCÍCIO ... 793.376,08")
 
 --- TEXTO EXTRAÍDO DO PDF ---
 {texto_pdf}
@@ -116,22 +95,17 @@ Forneça um relatório em Markdown altamente estruturado contendo exatamente as 
 
                 response = client.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
-                    model="openai/gpt-oss-120b",
-                    temperature=0.1,
-                    max_tokens=4096,
+                    model="llama-3.3-70b-versatile",
+                    temperature=0.1
                 )
 
-                # 3. Exibição do relatório final.
-                # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
-                # o que causava a renderização quebrada ("R`" no lugar de "R$").
-                conteudo = response.choices[0].message.content
-                conteudo_seguro = conteudo.replace("$", "\\$")
-
+                # 4. Exibição do relatório final (unsafe_allow_html=True permite o HTML amarelo)
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
-                st.markdown(conteudo_seguro, unsafe_allow_html=True)
+                st.markdown(response.choices[0].message.content, unsafe_allow_html=True)
 
-                with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
+                # 5. Texto bruto extraído, para conferência manual dos valores
+                with st.expander("🔍 Ver texto bruto extraído do PDF (para conferência)"):
                     st.text(texto_pdf)
 
             except Exception as e:
