@@ -3,7 +3,7 @@ from groq import Groq
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 # Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
@@ -19,6 +19,31 @@ else:
 
 # Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
+
+
+def preprocessar_imagem(img: Image.Image) -> Image.Image:
+    """Melhora a legibilidade da imagem antes do OCR: escala de cinza,
+    aumento de contraste, nitidez e binarização (preto/branco puro)."""
+    img_gray = img.convert("L")
+    img_gray = ImageOps.autocontrast(img_gray, cutoff=1)
+    img_gray = img_gray.filter(ImageFilter.SHARPEN)
+    # Binarização: tudo abaixo de 150 vira preto, acima vira branco
+    img_bin = img_gray.point(lambda p: 255 if p > 150 else 0)
+    return img_bin
+
+
+def ocr_melhor_resultado(img: Image.Image) -> str:
+    """Roda o OCR com dois modos (psm 6 e psm 4) e mantém o texto mais completo,
+    usando a quantidade de dígitos numéricos como critério de qualidade."""
+    candidatos = []
+    for psm in ["6", "4"]:
+        config = f"--oem 3 --psm {psm}"
+        texto = pytesseract.image_to_string(img, lang="por", config=config)
+        qtd_digitos = sum(c.isdigit() for c in texto)
+        candidatos.append((qtd_digitos, texto))
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    return candidatos[0][1]
+
 
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
@@ -36,17 +61,16 @@ if pdf_file and groq_api_key:
 
                 # 2. Se o PDF for escaneado, aplica OCR otimizado
                 if len(texto_pdf.strip()) < 50:
-                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem...")
-                    images = convert_from_bytes(bytes_data, dpi=300)
+                    st.info("ℹ️ PDF escaneado/fotografado detectado. Executando leitura via OCR com tratamento de imagem reforçado...")
+                    images = convert_from_bytes(bytes_data, dpi=400)
                     texto_pdf = ""
                     for img in images:
-                        img_gray = img.convert('L')
-                        texto_ocr = pytesseract.image_to_string(img_gray, lang="por", config='--psm 6')
-                        texto_pdf += texto_ocr + "\n"
+                        img_tratada = preprocessar_imagem(img)
+                        texto_pdf += ocr_melhor_resultado(img_tratada) + "\n"
 
                 # Trava de segurança final
                 if len(texto_pdf.strip()) < 30:
-                    st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
+                    st.error("⚠️ Não foi possível reconhecer o texto do documento. Tente enviar um PDF com resolução melhor (scan nítido, sem inclinação/reflexo).")
                     st.stop()
 
                 # 3. Envio para a Groq usando tags HTML para a cor amarela
@@ -61,12 +85,14 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais.
 
 REGRAS OBRIGATÓRIAS DE PRECISÃO NUMÉRICA (MUITO IMPORTANTE):
-4. NUNCA arredonde, corrija ou "adivinhe" um valor numérico. Copie os dígitos EXATAMENTE como aparecem no texto extraído, incluindo pontos e vírgulas.
-5. Antes de responder, releia o texto extraído e localize a ÚLTIMA ocorrência de cada rótulo (ex: "LUCRO LÍQUIDO DO EXERCÍCIO", "PREJUÍZO DO EXERCÍCIO"), pois normalmente é o valor totalizado/oficial da linha final da demonstração.
-6. Contas como "Imobilizado", "Investimentos" e "Intangível" costumam estar DENTRO do Ativo Não Circulante, mesmo que não apareçam isoladas no topo do documento. Procure essas linhas no corpo do texto inteiro antes de dizer "não informado".
-7. Se um valor numérico tiver 6 dígitos ou mais, cite entre parênteses e aspas o trecho exato (linha) de onde ele foi retirado do texto extraído, logo após o valor, para conferência. Exemplo: <span style="color: #F1C40F; font-weight: bold;">R$ 793.376,08</span> ("LUCRO LÍQUIDO DO EXERCÍCIO ... 793.376,08")
+4. O texto abaixo veio de OCR e pode ter ruído (letras soltas, símbolos, pontuação estranha misturada aos números). Ignore o ruído ao redor e extraia o número mais completo e coerente para cada rótulo — não descarte o valor só porque há lixo textual perto dele.
+5. NUNCA arredonde, corrija ou "adivinhe" dígitos que não estão no texto. Copie os dígitos exatamente como aparecem, incluindo pontos e vírgulas.
+6. Antes de responder, releia o texto extraído e localize a ÚLTIMA ocorrência de cada rótulo (ex: "LUCRO LÍQUIDO DO EXERCÍCIO"), pois normalmente é o valor totalizado/oficial da linha final.
+7. Contas como "Imobilizado", "Investimentos" e "Intangível" costumam estar DENTRO do Ativo Não Circulante. Procure essas linhas no corpo do texto inteiro antes de dizer "não informado".
+8. Só escreva "não informado" se o rótulo realmente não aparecer em NENHUM lugar do texto, mesmo de forma abreviada ou com ruído ao redor. Antes de concluir isso, procure variações como "ATIVO CIRC", "TOTAL DO ATIVO", "ATIVO TOTAL" etc.
+9. Se um valor numérico tiver 6 dígitos ou mais, cite entre parênteses e aspas o trecho exato (linha) de onde ele foi retirado, logo após o valor, para conferência.
 
---- TEXTO EXTRAÍDO DO PDF ---
+--- TEXTO EXTRAÍDO DO PDF (via OCR, pode ter ruído) ---
 {texto_pdf}
 -----------------------------
 
