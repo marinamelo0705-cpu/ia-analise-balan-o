@@ -52,14 +52,31 @@ de "tesseract não encontrado" assim que tenta processar um PDF escaneado. Basta
 arquivo estar na raiz do repositório para o Cloud instalar tudo automaticamente no
 próximo deploy.
 
+## Como os 10 números do balanço são extraídos
+
+O balanço é uma tabela (Descrição | Saldo Atual). O app faz OCR preservando a posição
+de cada palavra (`pytesseract.image_to_data`), reagrupa as palavras em **linhas** na
+ordem em que aparecem no papel e só então separa cada linha em `(rótulo da conta,
+valor no final da linha)`. Isso evita o problema clássico de OCR em tabelas: o rótulo
+de uma conta colar no valor de outra.
+
+Os 10 campos pedidos (Ativo Circulante, Ativo Não Circulante, Ativo Total, Passivo
+Circulante, Exigível Não Circulante, Patrimônio Líquido, Prejuízo Acumulado, Capital
+Social, Lucro Líquido e Imobilizado) são casados por **palavra-chave contábil em
+código Python** — não pedimos pro modelo de IA "adivinhar" esses números. O LLM
+(Groq) só é usado para escrever o texto de diagnóstico/recomendações; os valores
+que aparecem no relatório vêm sempre do parser determinístico.
+
 ## O que o app confere automaticamente
 
-Depois de extrair os valores, o app valida:
+Depois de extrair os valores, o app valida (prova real do balanço):
 
 - `Ativo Circulante + Ativo Não Circulante = Ativo Total`
-- `Passivo Circulante + Exigível Não Circulante + Patrimônio Líquido = Ativo Total`
+- `Passivo Circulante + Exigível Não Circulante + Patrimônio Líquido = Passivo Total`
   (equação contábil básica: Ativo = Passivo + PL)
-- Consistência da DRE (`Receita Líquida − Custos = Lucro Bruto`), quando houver DRE.
+- `Ativo Total = Passivo Total`
 
-Se algo não bater, aparece um aviso na tela pedindo para conferir manualmente — em vez
-de apresentar um número possivelmente errado como se fosse certo.
+Se algo não bater (diferença maior que R$ 1,00) ou se um campo não for localizado no
+texto, aparece um aviso explícito (⚠️) em vez de apresentar um número possivelmente
+errado como se fosse certo. Use o expansor "Ver linhas extraídas por página" no final
+do relatório para auditar exatamente o que o OCR leu, linha por linha.
