@@ -4,48 +4,92 @@ import streamlit as st
 from groq import Groq
 import pdfplumber
 import pytesseract
+from pytesseract import Output
 from pdf2image import convert_from_bytes
 from PIL import Image
 import numpy as np
 import cv2
 
-# Garante que a saída padrão use UTF-8, evitando erros de codificação com
-# emojis/acentos quando o app roda em ambientes com locale ASCII (comum
-# no Windows ou em alguns provedores de hospedagem restritos)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
 st.title("📊 Analisador Inteligente de Balanços e DRE")
 st.markdown("Suba o arquivo PDF contábil da empresa para extrair Ativo, Passivo, Patrimônio Líquido, Resultado e Capital de Giro.")
 
-# Busca a chave salva nos Secrets do Streamlit ou pede na barra lateral
 if "GROQ_API_KEY" in st.secrets:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 else:
     groq_api_key = st.sidebar.text_input("Insira sua API Key da Groq (Grátis):", type="password")
     st.sidebar.info("Pegue sua chave gratuita em: https://console.groq.com/")
 
-# Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
 
 
 def preparar_imagem_para_ocr(imagem_pil):
-    """
-    Pré-processa a imagem escaneada antes do OCR:
-    - converte pra tons de cinza
-    - aplica median blur pra atenuar marcas d'água / textura de fundo (hachurados finos)
-    - binariza com threshold automático (Otsu), deixando o texto preto puro
-      sobre fundo branco puro — isso melhora muito a leitura do Tesseract em
-      documentos escaneados com ruído/marca d'água sobre a tabela.
-    """
     arr = np.array(imagem_pil.convert('L'))
     arr = cv2.medianBlur(arr, 3)
     _, arr_bin = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return Image.fromarray(arr_bin)
+
+
+def reler_linha_resultado(imagem_pil):
+    """
+    Localiza a linha "LUCRO/PREJUÍZO DO EXERCÍCIO" na imagem original,
+    recorta SÓ essa linha, amplia a resolução em 3x e refaz o OCR isolado
+    nela — sem duplicar o OCR da página inteira (evita estourar tokens).
+    """
+    try:
+        arr_cinza = np.array(imagem_pil.convert('L'))
+        dados = pytesseract.image_to_data(
+            arr_cinza, lang="por", config='--oem 3 --psm 6', output_type=Output.DICT
+        )
+
+        palavras_alvo = ["LUCRO", "PREJUÍZO", "PREJUIZO"]
+        linha_alvo = None
+        n = len(dados['text'])
+        for idx in range(n):
+            palavra = dados['text'][idx].strip().upper()
+            if any(p in palavra for p in palavras_alvo):
+                linha_alvo = (dados['block_num'][idx], dados['par_num'][idx], dados['line_num'][idx])
+                break
+
+        if linha_alvo is None:
+            return None
+
+        xs, ys_topo, ys_base = [], [], []
+        for idx in range(n):
+            chave = (dados['block_num'][idx], dados['par_num'][idx], dados['line_num'][idx])
+            if chave == linha_alvo and dados['text'][idx].strip():
+                x, y, w, h = dados['left'][idx], dados['top'][idx], dados['width'][idx], dados['height'][idx]
+                xs.append(x)
+                xs.append(x + w)
+                ys_topo.append(y)
+                ys_base.append(y + h)
+
+        if not xs:
+            return None
+
+        altura_img, largura_img = arr_cinza.shape
+        y0 = max(0, min(ys_topo) - 12)
+        y1 = min(altura_img, max(ys_base) + 12)
+        x0 = max(0, min(xs) - 20)
+        x1 = min(largura_img, max(xs) + 400)
+
+        recorte = arr_cinza[y0:y1, x0:x1]
+        if recorte.size == 0:
+            return None
+
+        recorte_ampliado = cv2.resize(recorte, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        recorte_ampliado = cv2.medianBlur(recorte_ampliado, 3)
+        _, recorte_bin = cv2.threshold(recorte_ampliado, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        texto_linha = pytesseract.image_to_string(recorte_bin, lang="por", config='--oem 3 --psm 7').strip()
+        return texto_linha if texto_linha else None
+    except Exception:
+        return None
 
 
 if pdf_file and groq_api_key:
@@ -54,21 +98,14 @@ if pdf_file and groq_api_key:
             try:
                 bytes_data = pdf_file.read()
                 texto_pdf = ""
+                leitura_precisa_resultado = None
 
-                # 1. Extração página a página: cada página é avaliada individualmente.
-                #    Isso evita o problema de PDFs "mistos" (algumas páginas com texto
-                #    digital e outras escaneadas) — se o documento inteiro tivesse texto
-                #    suficiente no total, páginas escaneadas isoladas eram ignoradas.
                 with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
                     for i, page in enumerate(pdf.pages, start=1):
                         t = page.extract_text()
                         if t and len(t.strip()) >= 20:
                             texto_pdf += t + "\n"
                         else:
-                            # Página sem texto digital suficiente: escaneada/imagem.
-                            # Renderiza em alta resolução (400 dpi) e pré-processa
-                            # antes do OCR — resolve o problema de marcas d'água /
-                            # texturas de fundo que atrapalham a leitura dos números.
                             st.info(f"ℹ️ Página {i} parece escaneada/fotografada. Aplicando OCR com tratamento de imagem...")
                             imagens_pagina = convert_from_bytes(bytes_data, dpi=400, first_page=i, last_page=i)
                             for img in imagens_pagina:
@@ -76,12 +113,21 @@ if pdf_file and groq_api_key:
                                 texto_ocr = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
                                 texto_pdf += texto_ocr + "\n"
 
-                # Trava de segurança final
+                                if leitura_precisa_resultado is None:
+                                    leitura_precisa_resultado = reler_linha_resultado(img)
+
                 if len(texto_pdf.strip()) < 30:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
 
-                # 2. Envio para a Groq (GPT-OSS 120B) usando tags HTML para a cor amarela
+                bloco_leitura_precisa = ""
+                if leitura_precisa_resultado:
+                    bloco_leitura_precisa = f"""
+--- LEITURA DE ALTA PRECISÃO DA LINHA DE RESULTADO (recorte ampliado 3x, mais confiável que o texto geral acima para este valor específico) ---
+{leitura_precisa_resultado}
+-----------------------------
+"""
+
                 client = Groq(api_key=groq_api_key)
 
                 prompt = f"""
@@ -98,11 +144,12 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais. Se um valor realmente não constar no texto, escreva "Não informado no documento" ao invés de inventar.
 4. NÃO escreva parágrafos, diagnóstico, análise ou recomendações. A resposta deve conter APENAS a lista de itens abaixo, nada além disso.
 5. Calcule o Capital de Giro Líquido como: Ativo Circulante − Passivo Circulante. Mostre a conta feita entre parênteses.
-6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício (linha "LUCRO LÍQUIDO DO EXERCÍCIO" ou "PREJUÍZO DO EXERCÍCIO") e rotule corretamente.
+6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício (linha "LUCRO LÍQUIDO DO EXERCÍCIO" ou "PREJUÍZO DO EXERCÍCIO") e rotule corretamente. Existe abaixo uma seção "LEITURA DE ALTA PRECISÃO DA LINHA DE RESULTADO" (se presente) — ela é um recorte ampliado 3x feito especificamente nessa linha e é MAIS CONFIÁVEL que o texto geral para esse valor. Priorize sempre essa leitura de alta precisão quando ela existir.
 
 --- TEXTO EXTRAÍDO DO PDF ---
 {texto_pdf}
 -----------------------------
+{bloco_leitura_precisa}
 
 Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
 
@@ -127,9 +174,6 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
                     max_tokens=4096,
                 )
 
-                # 3. Exibição do relatório final.
-                # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
-                # o que causava a renderização quebrada ("R`" no lugar de "R$").
                 conteudo = response.choices[0].message.content
                 conteudo_seguro = conteudo.replace("$", "\\$")
 
@@ -139,6 +183,9 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
 
                 with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
                     st.text(texto_pdf)
+                    if leitura_precisa_resultado:
+                        st.markdown("**Leitura de alta precisão da linha de resultado:**")
+                        st.text(leitura_precisa_resultado)
 
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
