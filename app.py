@@ -116,7 +116,7 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
 * **Exigível Não Circulante:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 * **Patrimônio Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 * **Capital de Giro Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span> (Ativo Circulante − Passivo Circulante)
-* **Resultado do Exercício (Lucro ou Prejuízo):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+* **Resultado do Exercício (Lucro):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 * **Prejuízos Acumulados:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 """
 
