@@ -48,6 +48,14 @@ def preparar_imagem_para_ocr(imagem_pil):
     return Image.fromarray(arr_bin)
 
 
+def limpar_texto_ocr(texto: str) -> str:
+    """Remove linhas vazias e espaços redundantes do texto de OCR, reduzindo
+    a quantidade de tokens enviados à API sem perder nenhuma informação."""
+    linhas = [linha.strip() for linha in texto.splitlines()]
+    linhas = [linha for linha in linhas if linha]
+    return "\n".join(linhas)
+
+
 def ocr_dupla_leitura(img_tratada):
     """
     Roda o Tesseract em dois modos de segmentação de página (psm 6 e psm 4) e
@@ -59,8 +67,8 @@ def ocr_dupla_leitura(img_tratada):
     texto_psm6 = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
     texto_psm4 = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 4')
     return (
-        "\n[Leitura OCR - modo A]\n" + texto_psm6 +
-        "\n[Leitura OCR - modo B]\n" + texto_psm4
+        "\n[Leitura OCR - modo A]\n" + limpar_texto_ocr(texto_psm6) +
+        "\n[Leitura OCR - modo B]\n" + limpar_texto_ocr(texto_psm4)
     )
 
 
@@ -79,7 +87,7 @@ if pdf_file and groq_api_key:
                     for i, page in enumerate(pdf.pages, start=1):
                         t = page.extract_text()
                         if t and len(t.strip()) >= 20:
-                            texto_pdf += t + "\n"
+                            texto_pdf += limpar_texto_ocr(t) + "\n"
                         else:
                             # Página sem texto digital suficiente: escaneada/imagem.
                             # Renderiza em alta resolução (400 dpi), pré-processa
@@ -95,6 +103,13 @@ if pdf_file and groq_api_key:
                 if len(texto_pdf.strip()) < 30:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
                     st.stop()
+
+                # Limite aproximado de caracteres pra não estourar o TPM do plano gratuito da Groq
+                # (regra prática: ~4 caracteres por token; deixa margem para o prompt de instruções)
+                LIMITE_CARACTERES = 22000
+                if len(texto_pdf) > LIMITE_CARACTERES:
+                    st.warning("⚠️ Documento muito extenso — o texto foi resumido para caber no limite de tokens do plano gratuito da Groq. Se algum valor ficar faltando, considere enviar só as páginas do balanço/DRE.")
+                    texto_pdf = texto_pdf[:LIMITE_CARACTERES]
 
                 # 2. Envio para a Groq (GPT-OSS 120B) usando tags HTML para a cor amarela
                 client = Groq(api_key=groq_api_key)
@@ -138,7 +153,7 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (o rótulo
                     messages=[{"role": "user", "content": prompt}],
                     model="openai/gpt-oss-120b",
                     temperature=0.1,
-                    max_tokens=4096,
+                    max_tokens=1200,
                 )
 
                 # 3. Exibição do relatório final.
