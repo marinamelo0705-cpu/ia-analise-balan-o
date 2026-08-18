@@ -37,9 +37,10 @@ def preparar_imagem_para_ocr(imagem_pil):
 
 def reler_linha_resultado(imagem_pil):
     """
-    Localiza a linha "LUCRO/PREJUÍZO DO EXERCÍCIO" na imagem original,
+    Localiza a linha "LUCRO/PREJUÍZO ... EXERCÍCIO" na imagem original,
     recorta SÓ essa linha, amplia a resolução em 3x e refaz o OCR isolado
-    nela — sem duplicar o OCR da página inteira (evita estourar tokens).
+    nela. Exige "LUCRO"/"PREJU" E "EXERC" na mesma linha para não confundir
+    com outras linhas parecidas (ex: "Lucro Bruto").
     """
     try:
         arr_cinza = np.array(imagem_pil.convert('L'))
@@ -47,27 +48,36 @@ def reler_linha_resultado(imagem_pil):
             arr_cinza, lang="por", config='--oem 3 --psm 6', output_type=Output.DICT
         )
 
-        palavras_alvo = ["LUCRO", "PREJUÍZO", "PREJUIZO"]
+        palavras_resultado = ["LUCRO", "PREJU"]
         linha_alvo = None
         n = len(dados['text'])
+
+        linhas = {}
         for idx in range(n):
-            palavra = dados['text'][idx].strip().upper()
-            if any(p in palavra for p in palavras_alvo):
-                linha_alvo = (dados['block_num'][idx], dados['par_num'][idx], dados['line_num'][idx])
+            palavra = dados['text'][idx].strip()
+            if not palavra:
+                continue
+            chave = (dados['block_num'][idx], dados['par_num'][idx], dados['line_num'][idx])
+            linhas.setdefault(chave, []).append(idx)
+
+        for chave, indices in linhas.items():
+            texto_linha_completo = " ".join(dados['text'][idx] for idx in indices).upper()
+            tem_resultado = any(p in texto_linha_completo for p in palavras_resultado)
+            tem_exercicio = "EXERC" in texto_linha_completo
+            if tem_resultado and tem_exercicio:
+                linha_alvo = chave
                 break
 
         if linha_alvo is None:
             return None
 
         xs, ys_topo, ys_base = [], [], []
-        for idx in range(n):
-            chave = (dados['block_num'][idx], dados['par_num'][idx], dados['line_num'][idx])
-            if chave == linha_alvo and dados['text'][idx].strip():
-                x, y, w, h = dados['left'][idx], dados['top'][idx], dados['width'][idx], dados['height'][idx]
-                xs.append(x)
-                xs.append(x + w)
-                ys_topo.append(y)
-                ys_base.append(y + h)
+        for idx in linhas[linha_alvo]:
+            x, y, w, h = dados['left'][idx], dados['top'][idx], dados['width'][idx], dados['height'][idx]
+            xs.append(x)
+            xs.append(x + w)
+            ys_topo.append(y)
+            ys_base.append(y + h)
 
         if not xs:
             return None
@@ -113,8 +123,11 @@ if pdf_file and groq_api_key:
                                 texto_ocr = pytesseract.image_to_string(img_tratada, lang="por", config='--oem 3 --psm 6')
                                 texto_pdf += texto_ocr + "\n"
 
-                                if leitura_precisa_resultado is None:
-                                    leitura_precisa_resultado = reler_linha_resultado(img)
+                                # Roda em todas as páginas escaneadas, pois a linha do
+                                # resultado pode estar em qualquer uma delas
+                                leitura_desta_pagina = reler_linha_resultado(img)
+                                if leitura_desta_pagina:
+                                    leitura_precisa_resultado = leitura_desta_pagina
 
                 if len(texto_pdf.strip()) < 30:
                     st.error("⚠️ Não foi possível reconhecer o texto do documento. Certifique-se de que a imagem esteja legível.")
@@ -144,7 +157,8 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 3. Apresente os totais exatos que constam no balanço. NÃO tente inventar somas se o texto original do OCR já trouxe os totais. Se um valor realmente não constar no texto, escreva "Não informado no documento" ao invés de inventar.
 4. NÃO escreva parágrafos, diagnóstico, análise ou recomendações. A resposta deve conter APENAS a lista de itens abaixo, nada além disso.
 5. Calcule o Capital de Giro Líquido como: Ativo Circulante − Passivo Circulante. Mostre a conta feita entre parênteses.
-6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício (linha "LUCRO LÍQUIDO DO EXERCÍCIO" ou "PREJUÍZO DO EXERCÍCIO") e rotule corretamente. Existe abaixo uma seção "LEITURA DE ALTA PRECISÃO DA LINHA DE RESULTADO" (se presente) — ela é um recorte ampliado 3x feito especificamente nessa linha e é MAIS CONFIÁVEL que o texto geral para esse valor. Priorize sempre essa leitura de alta precisão quando ela existir.
+6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício (linha "LUCRO LÍQUIDO DO EXERCÍCIO" ou "PREJUÍZO DO EXERCÍCIO") e rotule corretamente. Existe abaixo uma seção "LEITURA DE ALTA PRECISÃO DA LINHA DE RESULTADO" (se presente) — ela é um recorte ampliado 3x feito especificamente nessa linha e é MAIS CONFIÁVEL que o texto geral para esse valor.
+7. CONFERÊNCIA OBRIGATÓRIA DO RESULTADO: se o texto contiver as linhas "Resultado Antes do IR" (ou "Resultado Antes do IR e CSLL"), "Provisões" (do IR/CSLL, geralmente um valor negativo/entre parênteses logo após o Resultado Antes do IR) e "Participações e Contribuições" (também negativo/entre parênteses), CALCULE o Lucro/Prejuízo Líquido do Exercício como: Resultado Antes do IR − Provisões − Participações e Contribuições (tratando os valores entre parênteses como negativos/subtraindo-os). Se esse cálculo divergir da linha "LUCRO LÍQUIDO DO EXERCÍCIO" lida diretamente (por exemplo, diferença nos primeiros dígitos, sinal de possível erro de leitura/mancha no documento), CONFIE no valor calculado, pois ele é derivado de números que aparecem de forma mais nítida em outras linhas do documento.
 
 --- TEXTO EXTRAÍDO DO PDF ---
 {texto_pdf}
