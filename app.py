@@ -1,5 +1,7 @@
 import sys
 import io
+import json
+import re
 import streamlit as st
 from groq import Groq
 import pdfplumber
@@ -132,6 +134,75 @@ def reler_linha_resultado(imagem_pil):
         return None
 
 
+def calcular_zscore_altman(dados):
+    """
+    Calcula o Z''-Score de Altman — a variante do modelo pensada para empresas
+    privadas / mercados emergentes (Altman, Hartzell & Peck, 1995), que não
+    depende do valor de mercado das ações nem da Receita de Vendas. É a
+    variante mais adequada aqui, já que o app lê balanços de empresas
+    brasileiras tipicamente não listadas em bolsa.
+
+    O cálculo é feito em Python (não pela IA) para evitar erro de arredondamento
+    ou de aritmética em uma fórmula com 4 divisões e pesos decimais.
+
+    Fórmula: Z'' = 6,56*X1 + 3,26*X2 + 6,72*X3 + 1,05*X4, onde:
+      X1 = Capital de Giro Líquido / Ativo Total
+      X2 = Lucros/Prejuízos Acumulados / Ativo Total
+      X3 = EBIT (proxy) / Ativo Total
+      X4 = Patrimônio Líquido / Passivo Total
+
+    `dados` é o dicionário extraído do bloco JSON retornado pela IA junto com
+    a lista de indicadores. Retorna None se faltar algum valor obrigatório.
+    """
+    try:
+        ativo_total = float(dados["ativo_total"])
+        ativo_circulante = float(dados["ativo_circulante"])
+        passivo_circulante = float(dados["passivo_circulante"])
+        exigivel_nao_circulante = float(dados["exigivel_nao_circulante"])
+        patrimonio_liquido = float(dados["patrimonio_liquido"])
+
+        lucros_prejuizos_acumulados = dados.get("prejuizos_acumulados")
+        lucros_prejuizos_acumulados = float(lucros_prejuizos_acumulados) if lucros_prejuizos_acumulados is not None else 0.0
+
+        # EBIT não é um item extraído diretamente — usamos como proxy o
+        # "Resultado Antes do IR e CSLL" (mais próximo do conceito de EBIT).
+        # Se essa linha não existir no documento, caímos para o Resultado do
+        # Exercício (menos preciso, pois já é líquido de IR/CSLL/provisões),
+        # e sinalizamos isso para exibir um aviso ao usuário.
+        usou_fallback_ebit = False
+        ebit_proxy = dados.get("resultado_antes_ir_csll")
+        if ebit_proxy is None:
+            ebit_proxy = dados.get("resultado_exercicio")
+            usou_fallback_ebit = True
+        if ebit_proxy is None:
+            return None
+        ebit_proxy = float(ebit_proxy)
+
+        passivo_total = passivo_circulante + exigivel_nao_circulante
+        capital_de_giro = ativo_circulante - passivo_circulante
+
+        if ativo_total == 0 or passivo_total == 0:
+            return None
+
+        x1 = capital_de_giro / ativo_total
+        x2 = lucros_prejuizos_acumulados / ativo_total
+        x3 = ebit_proxy / ativo_total
+        x4 = patrimonio_liquido / passivo_total
+
+        z = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
+
+        if z > 2.6:
+            zona = "🟢 Zona Segura"
+        elif z >= 1.1:
+            zona = "🟡 Zona de Penumbra (Cinza)"
+        else:
+            zona = "🔴 Zona de Perigo"
+
+        return {"z": z, "zona": zona, "usou_fallback_ebit": usou_fallback_ebit}
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return None
+
+
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
         with st.spinner("Lendo documento e extraindo dados (pode levar alguns segundos se for escaneado)..."):
@@ -201,12 +272,27 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício e rotule corretamente como "Lucro do Exercício" ou "Prejuízo do Exercício". A linha "LUCRO LÍQUIDO DO EXERCÍCIO" costuma vir borrada/manchada no scan — se ela tiver caracteres estranhos, letras misturadas com números, ou não bater com o cálculo da regra 7 abaixo, IGNORE a leitura direta e use exclusivamente o valor calculado pela regra 7.
 7. CÁLCULO OBRIGATÓRIO E PRIORITÁRIO DO RESULTADO: se o texto contiver "Resultado Antes do IR" (ou "Resultado Antes do IR e CSLL"), "Provisões" (valor entre parênteses logo após) e "Participações e Contribuições" (também entre parênteses), CALCULE: Resultado Antes do IR − Provisões − Participações e Contribuições (valores entre parênteses são negativos). Use esse valor calculado como o "Resultado do Exercício" da resposta, SEMPRE que essas três linhas estiverem disponíveis — não use a leitura direta da linha "LUCRO LÍQUIDO DO EXERCÍCIO" nesse caso, pois ela é a mais sujeita a erro de OCR no documento.
 8. CÁLCULO DO ATIVO NÃO CIRCULANTE: se não houver uma linha explícita "ATIVO NÃO CIRCULANTE" com um valor total no texto, mas houver "Ativo Total" e "Ativo Circulante", CALCULE: Ativo Total − Ativo Circulante. Use esse valor calculado em vez de escrever "Não informado no documento".
+9. Após a lista de itens, inclua um bloco de código JSON (delimitado por ```json e ```) com os MESMOS valores acima, mas em formato NUMÉRICO BRUTO — sem "R$", sem separador de milhar, com PONTO como separador decimal (padrão JSON), e SEM nenhum texto antes ou depois do bloco. Esse JSON é usado internamente pelo sistema para cálculos adicionais e não é mostrado ao usuário. Se o Resultado do Exercício for Prejuízo, ou se os Prejuízos/Lucros Acumulados forem negativos, use sinal negativo no número. Se algum valor não existir no documento, use null (nunca invente). Preencha também "resultado_antes_ir_csll" com o valor de "Resultado Antes do IR" ou "Resultado Antes do IR e CSLL" ANTES de descontar Provisões/Participações (use null se essa linha não existir no texto). Formato exato das chaves:
+```json
+{{
+  "ativo_circulante": 0.0,
+  "ativo_nao_circulante": 0.0,
+  "ativo_total": 0.0,
+  "passivo_circulante": 0.0,
+  "exigivel_nao_circulante": 0.0,
+  "patrimonio_liquido": 0.0,
+  "capital_de_giro_liquido": 0.0,
+  "resultado_exercicio": 0.0,
+  "prejuizos_acumulados": 0.0,
+  "resultado_antes_ir_csll": null
+}}
+```
 
 --- TEXTO EXTRAÍDO DO PDF ---
 {texto_pdf}
 -----------------------------
 
-Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
+Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco JSON da regra 9 logo depois da lista):
 
 ### 📊 RESULTADO DA ANÁLISE
 
@@ -219,6 +305,10 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
 * **Capital de Giro Líquido:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span> (Ativo Circulante − Passivo Circulante)
 * **Resultado do Exercício (Lucro):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 * **Prejuízos Acumulados:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
+
+```json
+{{ ... }}
+```
 """
 
                 response = client.chat.completions.create(
@@ -228,15 +318,76 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
                     max_tokens=4096,
                 )
 
-                # 3. Exibição do relatório final.
+                conteudo = response.choices[0].message.content
+
+                # 3. Extrai o bloco JSON com os valores numéricos brutos (regra 9 do
+                #    prompt), usado só internamente para calcular o Z-Score de Altman
+                #    em Python — mais confiável do que pedir pra IA fazer a divisão na
+                #    mão. O bloco é removido do texto antes de exibir ao usuário.
+                dados_numericos = None
+                match_json = re.search(r"```json\s*(\{.*?\})\s*```", conteudo, re.DOTALL)
+                if match_json:
+                    try:
+                        dados_numericos = json.loads(match_json.group(1))
+                    except json.JSONDecodeError:
+                        dados_numericos = None
+                    conteudo = (conteudo[:match_json.start()] + conteudo[match_json.end():]).rstrip()
+
+                resultado_zscore = calcular_zscore_altman(dados_numericos) if dados_numericos else None
+
+                if resultado_zscore:
+                    linha_zscore = (
+                        f'\n* **Z-Score de Altman:** '
+                        f'<span style="color: #F1C40F; font-weight: bold;">{resultado_zscore["z"]:.2f}</span>'
+                        f' — {resultado_zscore["zona"]}'
+                    )
+                    if resultado_zscore["usou_fallback_ebit"]:
+                        linha_zscore += (
+                            " *(calculado usando o Resultado do Exercício como aproximação de EBIT, "
+                            "pois o documento não trazia 'Resultado Antes do IR e CSLL')*"
+                        )
+                    conteudo += linha_zscore
+                else:
+                    conteudo += (
+                        "\n* **Z-Score de Altman:** Não foi possível calcular "
+                        "(faltam dados suficientes no documento)."
+                    )
+
+                # 4. Exibição do relatório final.
                 # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
                 # o que causava a renderização quebrada ("R`" no lugar de "R$").
-                conteudo = response.choices[0].message.content
                 conteudo_seguro = conteudo.replace("$", "\\$")
 
                 st.success("Análise concluída com sucesso!")
                 st.markdown("---")
                 st.markdown(conteudo_seguro, unsafe_allow_html=True)
+
+                if resultado_zscore:
+                    with st.expander("ℹ️ O que é o Z-Score de Altman?"):
+                        st.markdown(
+                            """
+O **Z-Score de Altman** é um indicador que estima a probabilidade de uma empresa
+enfrentar dificuldades financeiras graves (insolvência/falência) em um horizonte
+de até dois anos, combinando indicadores de liquidez, rentabilidade e
+endividamento extraídos do balanço.
+
+Quanto **mais baixa** a nota, mais a empresa se aproxima da chamada **"Zona de
+Penumbra"** ou **"Zona de Perigo"**, indicando um estado financeiro crítico.
+
+- 🟢 **Zona Segura** (Z > 2,6): baixo risco de insolvência no curto/médio prazo.
+- 🟡 **Zona de Penumbra/Cinza** (1,1 ≤ Z ≤ 2,6): risco moderado, requer atenção.
+- 🔴 **Zona de Perigo** (Z < 1,1): alto risco de dificuldades financeiras graves.
+
+Este app usa a variante do modelo (Z'') voltada a empresas privadas e mercados
+emergentes, que não depende do valor de mercado das ações nem da Receita de
+Vendas — mais adequada a balanços de empresas brasileiras não listadas em bolsa.
+
+Fonte: [Investing.com Academy — "Altman Z-Score"](https://br.investing.com/academy/analysis/altman-z-score/)
+
+*O Z-Score é um indicador estatístico e não substitui a avaliação de um
+contador ou consultor financeiro habilitado.*
+"""
+                        )
 
                 with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
                     st.text(texto_pdf)
@@ -244,70 +395,4 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
                         st.markdown("**Leitura de alta precisão da linha de resultado:**")
                         st.text(leitura_precisa_resultado)
 
-                # 4. Análise descritiva: um segundo chamado à IA, separado do primeiro,
-                #    para não contaminar a extração estritamente numérica (regra 4 do
-                #    prompt acima) com texto corrido. Recebe os indicadores já calculados
-                #    (mais confiáveis que o texto bruto) e também o texto extraído do PDF,
-                #    que costuma trazer o detalhamento de despesas do DRE.
-                if incluir_analise_descritiva:
-                    with st.spinner("Gerando análise descritiva e sugestões..."):
-                        prompt_analise = f"""
-Você é um consultor financeiro e contábil experiente. Com base nos indicadores já calculados
-abaixo e no texto original extraído do documento (que pode conter o detalhamento de despesas/
-custos do DRE), escreva uma análise em português, em prosa corrida (sem tabelas), organizada
-em três partes com exatamente estes subtítulos em Markdown:
-
-### 💸 Principais Gastos e Despesas
-Descreva quais são as principais contas de despesa/custo identificadas no texto (ex: despesas
-administrativas, despesas financeiras, custo das mercadorias/serviços vendidos, despesas com
-pessoal etc.), citando os valores explícitos encontrados no texto quando estiverem disponíveis.
-Se o texto não detalhar despesas por conta, diga isso claramente e comente o nível geral de
-comprometimento financeiro com base apenas no Resultado do Exercício e no Passivo.
-
-### 🔮 Estimativa de Gastos Futuros
-A partir SOMENTE dos dados deste período disponível, apresente uma estimativa cautelosa da
-tendência de gastos para os próximos períodos. Deixe explícito que é uma estimativa aproximada
-e não uma previsão garantida, já que uma projeção confiável exigiria uma série histórica de
-vários períodos. Quando fizer sentido, aponte uma faixa aproximada ou percentual de variação
-plausível, sempre destacando a incerteza envolvida.
-
-### ✅ Sugestões de Gestão Financeira
-Dê de 3 a 5 sugestões práticas e específicas para a empresa, baseadas nos indicadores
-calculados (ex: capital de giro, endividamento, resultado do exercício, prejuízos acumulados).
-Seja objetivo e evite recomendações genéricas que sirvam para qualquer empresa.
-
-Regras obrigatórias:
-- NÃO invente valores que não constem no texto extraído ou nos indicadores já calculados.
-- NÃO repita a lista de indicadores já apresentada anteriormente ao usuário.
-- Ao final da resposta, inclua em itálico a frase: "Esta análise foi gerada por inteligência
-  artificial e tem caráter informativo. Não substitui a avaliação de um contador ou consultor
-  financeiro habilitado."
-
---- INDICADORES JÁ CALCULADOS ---
-{conteudo}
------------------------------
-
---- TEXTO EXTRAÍDO DO PDF (para detalhamento de despesas, se houver) ---
-{texto_pdf}
------------------------------
-"""
-                        try:
-                            response_analise = client.chat.completions.create(
-                                messages=[{"role": "user", "content": prompt_analise}],
-                                model="openai/gpt-oss-120b",
-                                temperature=0.3,
-                                max_tokens=2048,
-                            )
-                            analise_texto = response_analise.choices[0].message.content
-                            analise_segura = analise_texto.replace("$", "\\$")
-
-                            st.markdown("---")
-                            st.markdown(analise_segura, unsafe_allow_html=True)
-                        except Exception as e:
-                            st.warning(f"Não foi possível gerar a análise descritiva: {e}")
-
-            except Exception as e:
-                st.error(f"Erro ao processar o arquivo: {e}")
-
-elif pdf_file and not groq_api_key:
-    st.warning("⚠️ Insira a sua API Key da Groq para continuar.")
+                # 5. Análise descritiva: um
