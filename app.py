@@ -290,6 +290,16 @@ def calcular_zscore_altman(dados):
 
 if pdf_file and groq_api_key:
     if st.button("🚀 Processar e Analisar Balanço"):
+        # Limpa o resultado da rodada anterior antes de começar uma nova —
+        # assim, se este processamento falhar, não fica um resultado antigo
+        # e desatualizado escondido embaixo do erro.
+        for chave in (
+            "resultado_conteudo", "resultado_zscore", "analise_descritiva",
+            "analise_descritiva_erro", "texto_pdf_debug", "leitura_precisa_debug",
+            "erro_processamento",
+        ):
+            st.session_state.pop(chave, None)
+
         with st.spinner("Lendo documento e extraindo dados (pode levar alguns segundos se for escaneado)..."):
             try:
                 bytes_data = pdf_file.read()
@@ -434,47 +444,23 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco
                         "(faltam dados suficientes no documento)."
                     )
 
-                # 4. Exibição do relatório final.
+                # 4. Guarda o resultado em st.session_state em vez de desenhar na tela
+                # aqui dentro. Se o resultado só existisse dentro deste "if
+                # st.button(...)", qualquer nova execução do script — por exemplo,
+                # se o navegador reconectar ao servidor no meio de um processamento
+                # demorado (comum com PDFs escaneados grandes) — faz o Streamlit
+                # rodar o arquivo de novo do zero; nessa nova rodada o botão não
+                # está mais "clicado", então tudo que dependia dele desaparecia da
+                # tela sem aviso. Guardando em session_state, o resultado sobrevive
+                # a essas reconexões e continua aparecendo até um novo processamento.
                 # Escapa "$" soltos para o Streamlit não confundir com LaTeX (\$...\$),
                 # o que causava a renderização quebrada ("R`" no lugar de "R$").
                 conteudo_seguro = conteudo.replace("$", "\\$")
 
-                st.success("Análise concluída com sucesso!")
-                st.markdown("---")
-                st.markdown(conteudo_seguro, unsafe_allow_html=True)
-
-                if resultado_zscore:
-                    with st.expander("ℹ️ O que é o Z-Score de Altman?"):
-                        st.markdown(
-                            """
-O **Z-Score de Altman** é um indicador que estima a probabilidade de uma empresa
-enfrentar dificuldades financeiras graves (insolvência/falência) em um horizonte
-de até dois anos, combinando indicadores de liquidez, rentabilidade e
-endividamento extraídos do balanço.
-
-Quanto **mais baixa** a nota, mais a empresa se aproxima da chamada **"Zona de
-Penumbra"** ou **"Zona de Perigo"**, indicando um estado financeiro crítico.
-
-- 🟢 **Zona Segura** (Z > 2,6): baixo risco de insolvência no curto/médio prazo.
-- 🟡 **Zona de Penumbra/Cinza** (1,1 ≤ Z ≤ 2,6): risco moderado, requer atenção.
-- 🔴 **Zona de Perigo** (Z < 1,1): alto risco de dificuldades financeiras graves.
-
-Este app usa a variante do modelo (Z'') voltada a empresas privadas e mercados
-emergentes, que não depende do valor de mercado das ações nem da Receita de
-Vendas — mais adequada a balanços de empresas brasileiras não listadas em bolsa.
-
-Fonte: [Investing.com Academy — "Altman Z-Score"](https://br.investing.com/academy/analysis/altman-z-score/)
-
-*O Z-Score é um indicador estatístico e não substitui a avaliação de um
-contador ou consultor financeiro habilitado.*
-"""
-                        )
-
-                with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
-                    st.text(texto_pdf)
-                    if leitura_precisa_resultado:
-                        st.markdown("**Leitura de alta precisão da linha de resultado:**")
-                        st.text(leitura_precisa_resultado)
+                st.session_state["resultado_conteudo"] = conteudo_seguro
+                st.session_state["resultado_zscore"] = resultado_zscore
+                st.session_state["texto_pdf_debug"] = texto_pdf
+                st.session_state["leitura_precisa_debug"] = leitura_precisa_resultado
 
                 # 5. Análise descritiva: um segundo chamado à IA, separado do primeiro,
                 #    para não contaminar a extração estritamente numérica (regra 4 do
@@ -531,15 +517,67 @@ Regras obrigatórias:
                                 max_tokens=2048,
                             )
                             analise_texto = response_analise.choices[0].message.content
-                            analise_segura = analise_texto.replace("$", "\\$")
-
-                            st.markdown("---")
-                            st.markdown(analise_segura, unsafe_allow_html=True)
+                            st.session_state["analise_descritiva"] = analise_texto.replace("$", "\\$")
                         except Exception as e:
-                            st.warning(f"Não foi possível gerar a análise descritiva: {e}")
+                            st.session_state["analise_descritiva_erro"] = str(e)
 
             except Exception as e:
-                st.error(f"Erro ao processar o arquivo: {e}")
+                st.session_state["erro_processamento"] = str(e)
 
 elif pdf_file and not groq_api_key:
     st.warning("⚠️ O app não está configurado corretamente. Avise o administrador.")
+
+# --- Renderização dos resultados ---
+# Fica FORA do "if st.button(...)" de propósito (veja o comentário no ponto 4
+# acima): assim o resultado continua na tela mesmo que o script rode de novo
+# por causa de uma reconexão, e some só quando um novo processamento começa
+# (que já limpa esses valores no início do bloco do botão).
+if st.session_state.get("erro_processamento"):
+    st.error(f"Erro ao processar o arquivo: {st.session_state['erro_processamento']}")
+
+if st.session_state.get("resultado_conteudo"):
+    st.success("Análise concluída com sucesso!")
+    st.markdown("---")
+    st.markdown(st.session_state["resultado_conteudo"], unsafe_allow_html=True)
+
+    if st.session_state.get("resultado_zscore"):
+        with st.expander("ℹ️ O que é o Z-Score de Altman?"):
+            st.markdown(
+                """
+O **Z-Score de Altman** é um indicador que estima a probabilidade de uma empresa
+enfrentar dificuldades financeiras graves (insolvência/falência) em um horizonte
+de até dois anos, combinando indicadores de liquidez, rentabilidade e
+endividamento extraídos do balanço.
+
+Quanto **mais baixa** a nota, mais a empresa se aproxima da chamada **"Zona de
+Penumbra"** ou **"Zona de Perigo"**, indicando um estado financeiro crítico.
+
+- 🟢 **Zona Segura** (Z > 2,6): baixo risco de insolvência no curto/médio prazo.
+- 🟡 **Zona de Penumbra/Cinza** (1,1 ≤ Z ≤ 2,6): risco moderado, requer atenção.
+- 🔴 **Zona de Perigo** (Z < 1,1): alto risco de dificuldades financeiras graves.
+
+Este app usa a variante do modelo (Z'') voltada a empresas privadas e mercados
+emergentes, que não depende do valor de mercado das ações nem da Receita de
+Vendas — mais adequada a balanços de empresas brasileiras não listadas em bolsa.
+
+Fonte: [Investing.com Academy — "Altman Z-Score"](https://br.investing.com/academy/analysis/altman-z-score/)
+
+*O Z-Score é um indicador estatístico e não substitui a avaliação de um
+contador ou consultor financeiro habilitado.*
+"""
+            )
+
+    with st.expander("🔍 Ver texto bruto extraído do PDF (debug)"):
+        st.text(st.session_state.get("texto_pdf_debug", ""))
+        if st.session_state.get("leitura_precisa_debug"):
+            st.markdown("**Leitura de alta precisão da linha de resultado:**")
+            st.text(st.session_state["leitura_precisa_debug"])
+
+    if st.session_state.get("analise_descritiva"):
+        st.markdown("---")
+        st.markdown(st.session_state["analise_descritiva"], unsafe_allow_html=True)
+    elif st.session_state.get("analise_descritiva_erro"):
+        st.warning(
+            "Não foi possível gerar a análise descritiva: "
+            f"{st.session_state['analise_descritiva_erro']}"
+        )
