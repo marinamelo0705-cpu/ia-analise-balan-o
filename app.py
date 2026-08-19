@@ -272,8 +272,7 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
 6. Para "Resultado do Exercício", identifique se é Lucro ou Prejuízo do exercício e rotule corretamente como "Lucro do Exercício" ou "Prejuízo do Exercício". A linha "LUCRO LÍQUIDO DO EXERCÍCIO" costuma vir borrada/manchada no scan — se ela tiver caracteres estranhos, letras misturadas com números, ou não bater com o cálculo da regra 7 abaixo, IGNORE a leitura direta e use exclusivamente o valor calculado pela regra 7.
 7. CÁLCULO OBRIGATÓRIO E PRIORITÁRIO DO RESULTADO: se o texto contiver "Resultado Antes do IR" (ou "Resultado Antes do IR e CSLL"), "Provisões" (valor entre parênteses logo após) e "Participações e Contribuições" (também entre parênteses), CALCULE: Resultado Antes do IR − Provisões − Participações e Contribuições (valores entre parênteses são negativos). Use esse valor calculado como o "Resultado do Exercício" da resposta, SEMPRE que essas três linhas estiverem disponíveis — não use a leitura direta da linha "LUCRO LÍQUIDO DO EXERCÍCIO" nesse caso, pois ela é a mais sujeita a erro de OCR no documento.
 8. CÁLCULO DO ATIVO NÃO CIRCULANTE: se não houver uma linha explícita "ATIVO NÃO CIRCULANTE" com um valor total no texto, mas houver "Ativo Total" e "Ativo Circulante", CALCULE: Ativo Total − Ativo Circulante. Use esse valor calculado em vez de escrever "Não informado no documento".
-9. Após a lista de itens, inclua um bloco de código JSON (delimitado por ```json e ```) com os MESMOS valores acima, mas em formato NUMÉRICO BRUTO — sem "R$", sem separador de milhar, com PONTO como separador decimal (padrão JSON), e SEM nenhum texto antes ou depois do bloco. Esse JSON é usado internamente pelo sistema para cálculos adicionais e não é mostrado ao usuário. Se o Resultado do Exercício for Prejuízo, ou se os Prejuízos/Lucros Acumulados forem negativos, use sinal negativo no número. Se algum valor não existir no documento, use null (nunca invente). Preencha também "resultado_antes_ir_csll" com o valor de "Resultado Antes do IR" ou "Resultado Antes do IR e CSLL" ANTES de descontar Provisões/Participações (use null se essa linha não existir no texto). Formato exato das chaves:
-```json
+9. Após a lista de itens, inclua um bloco de código JSON (delimitado por três crases e a palavra json, fechando com três crases) com os MESMOS valores acima, mas em formato NUMÉRICO BRUTO — sem "R$", sem separador de milhar, com PONTO como separador decimal (padrão JSON), e SEM nenhum texto antes ou depois do bloco. Esse JSON é usado internamente pelo sistema para cálculos adicionais e não é mostrado ao usuário. Se o Resultado do Exercício for Prejuízo, ou se os Prejuízos/Lucros Acumulados forem negativos, use sinal negativo no número. Se algum valor não existir no documento, use null (nunca invente). Preencha também "resultado_antes_ir_csll" com o valor de "Resultado Antes do IR" ou "Resultado Antes do IR e CSLL" ANTES de descontar Provisões/Participações (use null se essa linha não existir no texto). Formato exato das chaves (dentro do bloco de código json):
 {{
   "ativo_circulante": 0.0,
   "ativo_nao_circulante": 0.0,
@@ -286,13 +285,12 @@ REGRAS OBRIGATÓRIAS DE FORMATAÇÃO:
   "prejuizos_acumulados": 0.0,
   "resultado_antes_ir_csll": null
 }}
-```
 
 --- TEXTO EXTRAÍDO DO PDF ---
 {texto_pdf}
 -----------------------------
 
-Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco JSON da regra 9 logo depois da lista):
+Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco de código json da regra 9 logo depois da lista):
 
 ### 📊 RESULTADO DA ANÁLISE
 
@@ -306,9 +304,7 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco
 * **Resultado do Exercício (Lucro):** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 * **Prejuízos Acumulados:** <span style="color: #F1C40F; font-weight: bold;">R$ ...</span>
 
-```json
-{{ ... }}
-```
+(bloco de código json com os valores brutos, conforme regra 9)
 """
 
                 response = client.chat.completions.create(
@@ -325,7 +321,7 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown (e o bloco
                 #    em Python — mais confiável do que pedir pra IA fazer a divisão na
                 #    mão. O bloco é removido do texto antes de exibir ao usuário.
                 dados_numericos = None
-                match_json = re.search(r"```json\s*(\{.*?\})\s*```", conteudo, re.DOTALL)
+                match_json = re.search(r"`{3}json\s*(\{.*?\})\s*`{3}", conteudo, re.DOTALL)
                 if match_json:
                     try:
                         dados_numericos = json.loads(match_json.group(1))
@@ -395,4 +391,70 @@ contador ou consultor financeiro habilitado.*
                         st.markdown("**Leitura de alta precisão da linha de resultado:**")
                         st.text(leitura_precisa_resultado)
 
-                # 5. Análise descritiva: um
+                # 5. Análise descritiva: um segundo chamado à IA, separado do primeiro,
+                #    para não contaminar a extração estritamente numérica (regra 4 do
+                #    prompt acima) com texto corrido. Recebe os indicadores já calculados
+                #    (mais confiáveis que o texto bruto) e também o texto extraído do PDF,
+                #    que costuma trazer o detalhamento de despesas do DRE.
+                if incluir_analise_descritiva:
+                    with st.spinner("Gerando análise descritiva e sugestões..."):
+                        prompt_analise = f"""
+Você é um consultor financeiro e contábil experiente. Com base nos indicadores já calculados
+abaixo e no texto original extraído do documento (que pode conter o detalhamento de despesas/
+custos do DRE), escreva uma análise em português, em prosa corrida (sem tabelas), organizada
+em três partes com exatamente estes subtítulos em Markdown:
+
+### 💸 Principais Gastos e Despesas
+Descreva quais são as principais contas de despesa/custo identificadas no texto (ex: despesas
+administrativas, despesas financeiras, custo das mercadorias/serviços vendidos, despesas com
+pessoal etc.), citando os valores explícitos encontrados no texto quando estiverem disponíveis.
+Se o texto não detalhar despesas por conta, diga isso claramente e comente o nível geral de
+comprometimento financeiro com base apenas no Resultado do Exercício e no Passivo.
+
+### 🔮 Estimativa de Gastos Futuros
+A partir SOMENTE dos dados deste período disponível, apresente uma estimativa cautelosa da
+tendência de gastos para os próximos períodos. Deixe explícito que é uma estimativa aproximada
+e não uma previsão garantida, já que uma projeção confiável exigiria uma série histórica de
+vários períodos. Quando fizer sentido, aponte uma faixa aproximada ou percentual de variação
+plausível, sempre destacando a incerteza envolvida.
+
+### ✅ Sugestões de Gestão Financeira
+Dê de 3 a 5 sugestões práticas e específicas para a empresa, baseadas nos indicadores
+calculados (ex: capital de giro, endividamento, resultado do exercício, prejuízos acumulados).
+Seja objetivo e evite recomendações genéricas que sirvam para qualquer empresa.
+
+Regras obrigatórias:
+- NÃO invente valores que não constem no texto extraído ou nos indicadores já calculados.
+- NÃO repita a lista de indicadores já apresentada anteriormente ao usuário.
+- Ao final da resposta, inclua em itálico a frase: "Esta análise foi gerada por inteligência
+  artificial e tem caráter informativo. Não substitui a avaliação de um contador ou consultor
+  financeiro habilitado."
+
+--- INDICADORES JÁ CALCULADOS ---
+{conteudo}
+-----------------------------
+
+--- TEXTO EXTRAÍDO DO PDF (para detalhamento de despesas, se houver) ---
+{texto_pdf}
+-----------------------------
+"""
+                        try:
+                            response_analise = client.chat.completions.create(
+                                messages=[{"role": "user", "content": prompt_analise}],
+                                model="openai/gpt-oss-120b",
+                                temperature=0.3,
+                                max_tokens=2048,
+                            )
+                            analise_texto = response_analise.choices[0].message.content
+                            analise_segura = analise_texto.replace("$", "\\$")
+
+                            st.markdown("---")
+                            st.markdown(analise_segura, unsafe_allow_html=True)
+                        except Exception as e:
+                            st.warning(f"Não foi possível gerar a análise descritiva: {e}")
+
+            except Exception as e:
+                st.error(f"Erro ao processar o arquivo: {e}")
+
+elif pdf_file and not groq_api_key:
+    st.warning("⚠️ Insira a sua API Key da Groq para continuar.")
