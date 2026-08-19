@@ -1,4 +1,5 @@
 streamlit>=1.36
+streamlit-authenticator>=0.4.1
 groq>=0.9.0
 pdfplumber>=0.11.0
 pytesseract>=0.3.10
