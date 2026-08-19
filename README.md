@@ -20,8 +20,31 @@ A resposta é sempre uma lista objetiva, sem parágrafos ou recomendações, com
 8. **Capital de Giro Líquido** (calculado como Ativo Circulante − Passivo Circulante)
 9. **Resultado do Exercício** (Lucro ou Prejuízo do período, identificado automaticamente)
 10. **Prejuízos Acumulados**
+11. **Z-Score de Altman** — indicador de risco de insolvência (veja seção abaixo)
 
 Todos os valores monetários aparecem destacados em amarelo no relatório.
+
+## ⚠️ Z-Score de Altman
+
+O app calcula automaticamente o **Z-Score de Altman**, um indicador que estima a
+probabilidade de a empresa enfrentar dificuldades financeiras graves (insolvência/
+falência) em um horizonte de até dois anos. Quanto mais baixa a nota, mais a empresa
+se aproxima da chamada "Zona de Penumbra" ou "Zona de Perigo" — um estado financeiro
+crítico ([fonte](https://br.investing.com/academy/analysis/altman-z-score/)).
+
+- 🟢 **Zona Segura** (Z > 2,6)
+- 🟡 **Zona de Penumbra/Cinza** (1,1 ≤ Z ≤ 2,6)
+- 🔴 **Zona de Perigo** (Z < 1,1)
+
+Diferente dos outros indicadores, o Z-Score **não é calculado pela IA**: a IA só
+extrai os valores brutos do balanço (em um bloco JSON interno, não exibido), e o
+Python calcula a fórmula com precisão — evita erro de arredondamento numa conta com
+4 divisões. O app usa a variante **Z''** do modelo (Altman, Hartzell & Peck, 1995),
+pensada para empresas privadas/mercados emergentes: não depende do valor de mercado
+das ações nem da Receita de Vendas, o que a torna adequada a balanços de empresas
+brasileiras não listadas em bolsa. Se o documento não trouxer dados suficientes
+(ex: nenhuma linha de resultado), o app avisa que não foi possível calcular em vez
+de arriscar um número incorreto.
 
 ## 💬 Análise descritiva e sugestões (opcional)
 
