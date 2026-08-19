@@ -24,6 +24,43 @@ A resposta é sempre uma lista objetiva, sem parágrafos ou recomendações, com
 
 Todos os valores monetários aparecem destacados em amarelo no relatório.
 
+## 🔐 Login
+
+O app fica protegido por usuário e senha (via [streamlit-authenticator](https://github.com/mkhorasani/Streamlit-Authenticator)),
+para que só as pessoas da empresa consigam acessar — o link do app sozinho
+não é suficiente, e ninguém de fora fica usando a cota da chave da Groq.
+
+Depois de logar, a pessoa fica conectada por até 30 dias (cookie no
+navegador), sem precisar digitar usuário/senha toda vez que abrir o app.
+
+Os usuários são cadastrados em **Settings → Secrets** (não ficam no
+código nem no repositório). Exemplo de configuração:
+
+```toml
+GROQ_API_KEY = "a-chave-da-groq-da-empresa"
+
+[auth]
+cookie_name = "auth_analisador_balanco"
+cookie_key = "troque-por-uma-string-aleatoria-bem-grande-e-secreta"
+cookie_expiry_days = 30
+
+[auth.usuarios.maria]
+nome = "Maria Silva"
+senha = "escolha-uma-senha-forte-aqui"
+
+[auth.usuarios.joao]
+nome = "João Souza"
+senha = "outra-senha-forte-aqui"
+```
+
+- `cookie_key` pode ser qualquer string aleatória grande (só precisa ser
+  secreta e não mudar depois, senão os logins ativos expiram).
+- Para adicionar/remover um funcionário, basta editar essa lista em Secrets
+  — não precisa mexer no código nem fazer novo deploy.
+- As senhas ficam nos Secrets do Streamlit (criptografados e privados, o
+  mesmo lugar onde já fica a `GROQ_API_KEY`), nunca em texto público no
+  GitHub.
+
 ## ⚠️ Z-Score de Altman
 
 O app calcula automaticamente o **Z-Score de Altman**, um indicador que estima a
@@ -78,6 +115,7 @@ substitui a avaliação de um contador ou consultor financeiro habilitado.
 ## 🛠️ Tecnologias
 
 - [Streamlit](https://streamlit.io/) — interface web
+- [streamlit-authenticator](https://github.com/mkhorasani/Streamlit-Authenticator) — login por usuário/senha
 - [Groq](https://console.groq.com/) — inferência de IA (modelo `openai/gpt-oss-120b`)
 - [pdfplumber](https://github.com/jsvine/pdfplumber) — extração de texto nativo de PDF
 - [pytesseract](https://github.com/madmaze/pytesseract) + [pdf2image](https://github.com/Belval/pdf2image) — OCR para páginas escaneadas
@@ -116,11 +154,19 @@ cd ia-analise-balan-o
 pip install -r requirements.txt
 ```
 
-3. Configure sua chave da Groq. Crie o arquivo `.streamlit/secrets.toml`:
+3. Configure sua chave da Groq e os usuários de login. Crie o arquivo `.streamlit/secrets.toml`:
 ```toml
 GROQ_API_KEY = "sua_chave_aqui"
+
+[auth]
+cookie_name = "auth_analisador_balanco"
+cookie_key = "troque-por-uma-string-aleatoria-bem-grande-e-secreta"
+cookie_expiry_days = 30
+
+[auth.usuarios.maria]
+nome = "Maria Silva"
+senha = "escolha-uma-senha-forte-aqui"
 ```
-Ou insira a chave diretamente na barra lateral ao rodar o app (chave gratuita em [console.groq.com](https://console.groq.com/)).
 
 4. Rode a aplicação:
 ```bash
@@ -131,8 +177,5 @@ streamlit run app.py
 
 1. Faça push deste repositório para o GitHub.
 2. Acesse [share.streamlit.io](https://share.streamlit.io/) e conecte o repositório.
-3. Em **Settings → Secrets**, adicione:
-```toml
-GROQ_API_KEY = "sua_chave_aqui"
-```
+3. Em **Settings → Secrets**, adicione a `GROQ_API_KEY` e o bloco `[auth]` (veja a seção "🔐 Login" acima).
 4. Adicione um arquivo `packages.txt` na raiz do repositório com as dependências de sistema (o Streamlit Cloud roda em Linux):
