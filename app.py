@@ -33,6 +33,13 @@ else:
 # Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
 
+incluir_analise_descritiva = st.sidebar.checkbox(
+    "💬 Incluir análise descritiva e sugestões",
+    value=True,
+    help="Além dos indicadores calculados, gera um texto explicando os principais gastos, "
+         "uma estimativa de gastos futuros e sugestões de gestão financeira.",
+)
+
 
 def preparar_imagem_para_ocr(imagem_pil):
     """
@@ -236,6 +243,68 @@ Responda EXATAMENTE neste formato, preenchendo os valores em Markdown:
                     if leitura_precisa_resultado:
                         st.markdown("**Leitura de alta precisão da linha de resultado:**")
                         st.text(leitura_precisa_resultado)
+
+                # 4. Análise descritiva: um segundo chamado à IA, separado do primeiro,
+                #    para não contaminar a extração estritamente numérica (regra 4 do
+                #    prompt acima) com texto corrido. Recebe os indicadores já calculados
+                #    (mais confiáveis que o texto bruto) e também o texto extraído do PDF,
+                #    que costuma trazer o detalhamento de despesas do DRE.
+                if incluir_analise_descritiva:
+                    with st.spinner("Gerando análise descritiva e sugestões..."):
+                        prompt_analise = f"""
+Você é um consultor financeiro e contábil experiente. Com base nos indicadores já calculados
+abaixo e no texto original extraído do documento (que pode conter o detalhamento de despesas/
+custos do DRE), escreva uma análise em português, em prosa corrida (sem tabelas), organizada
+em três partes com exatamente estes subtítulos em Markdown:
+
+### 💸 Principais Gastos e Despesas
+Descreva quais são as principais contas de despesa/custo identificadas no texto (ex: despesas
+administrativas, despesas financeiras, custo das mercadorias/serviços vendidos, despesas com
+pessoal etc.), citando os valores explícitos encontrados no texto quando estiverem disponíveis.
+Se o texto não detalhar despesas por conta, diga isso claramente e comente o nível geral de
+comprometimento financeiro com base apenas no Resultado do Exercício e no Passivo.
+
+### 🔮 Estimativa de Gastos Futuros
+A partir SOMENTE dos dados deste período disponível, apresente uma estimativa cautelosa da
+tendência de gastos para os próximos períodos. Deixe explícito que é uma estimativa aproximada
+e não uma previsão garantida, já que uma projeção confiável exigiria uma série histórica de
+vários períodos. Quando fizer sentido, aponte uma faixa aproximada ou percentual de variação
+plausível, sempre destacando a incerteza envolvida.
+
+### ✅ Sugestões de Gestão Financeira
+Dê de 3 a 5 sugestões práticas e específicas para a empresa, baseadas nos indicadores
+calculados (ex: capital de giro, endividamento, resultado do exercício, prejuízos acumulados).
+Seja objetivo e evite recomendações genéricas que sirvam para qualquer empresa.
+
+Regras obrigatórias:
+- NÃO invente valores que não constem no texto extraído ou nos indicadores já calculados.
+- NÃO repita a lista de indicadores já apresentada anteriormente ao usuário.
+- Ao final da resposta, inclua em itálico a frase: "Esta análise foi gerada por inteligência
+  artificial e tem caráter informativo. Não substitui a avaliação de um contador ou consultor
+  financeiro habilitado."
+
+--- INDICADORES JÁ CALCULADOS ---
+{conteudo}
+-----------------------------
+
+--- TEXTO EXTRAÍDO DO PDF (para detalhamento de despesas, se houver) ---
+{texto_pdf}
+-----------------------------
+"""
+                        try:
+                            response_analise = client.chat.completions.create(
+                                messages=[{"role": "user", "content": prompt_analise}],
+                                model="openai/gpt-oss-120b",
+                                temperature=0.3,
+                                max_tokens=2048,
+                            )
+                            analise_texto = response_analise.choices[0].message.content
+                            analise_segura = analise_texto.replace("$", "\\$")
+
+                            st.markdown("---")
+                            st.markdown(analise_segura, unsafe_allow_html=True)
+                        except Exception as e:
+                            st.warning(f"Não foi possível gerar a análise descritiva: {e}")
 
             except Exception as e:
                 st.error(f"Erro ao processar o arquivo: {e}")
