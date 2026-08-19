@@ -23,6 +23,25 @@ A resposta é sempre uma lista objetiva, sem parágrafos ou recomendações, com
 
 Todos os valores monetários aparecem destacados em amarelo no relatório.
 
+## 💬 Análise descritiva e sugestões (opcional)
+
+Além da lista de indicadores, o app pode gerar um segundo bloco de texto, em prosa,
+com três seções:
+
+1. **💸 Principais Gastos e Despesas** — resume as contas de despesa/custo identificadas
+   no documento (quando o DRE detalha esses valores).
+2. **🔮 Estimativa de Gastos Futuros** — uma estimativa cautelosa de tendência para os
+   próximos períodos, sempre deixando claro que é uma aproximação (uma projeção robusta
+   exigiria série histórica de vários períodos).
+3. **✅ Sugestões de Gestão Financeira** — de 3 a 5 recomendações práticas baseadas nos
+   indicadores calculados (capital de giro, endividamento, resultado do exercício etc.).
+
+Essa análise é gerada em uma segunda chamada à IA, separada da extração numérica, para não
+misturar texto corrido com a lista objetiva de valores. Pode ser ativada/desativada pelo
+checkbox **"💬 Incluir análise descritiva e sugestões"** na barra lateral (ativado por padrão).
+Ao final do texto, o app sempre inclui um aviso de que a análise é gerada por IA e não
+substitui a avaliação de um contador ou consultor financeiro habilitado.
+
 ## ⚙️ Como funciona a extração
 
 1. O PDF é lido página por página com `pdfplumber`.
