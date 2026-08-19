@@ -3,6 +3,7 @@ import io
 import json
 import re
 import streamlit as st
+import streamlit_authenticator as stauth
 from groq import Groq
 import pdfplumber
 import pytesseract
@@ -20,17 +21,101 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
+def montar_credenciais_login():
+    """
+    Monta o dicionário de credenciais que o streamlit-authenticator espera,
+    a partir dos usuários cadastrados em st.secrets["auth"]["usuarios"].
+    As senhas ficam nos Secrets do Streamlit (nunca no repositório público),
+    exatamente como já era feito com a GROQ_API_KEY.
+
+    Formato esperado em .streamlit/secrets.toml:
+
+        [auth]
+        cookie_name = "auth_analisador_balanco"
+        cookie_key = "uma-string-aleatoria-bem-grande-e-secreta"
+        cookie_expiry_days = 30
+
+        [auth.usuarios.maria]
+        nome = "Maria Silva"
+        senha = "a-senha-dela-aqui"
+
+        [auth.usuarios.joao]
+        nome = "João Souza"
+        senha = "a-senha-dele-aqui"
+    """
+    usuarios_secrets = st.secrets.get("auth", {}).get("usuarios", {})
+    credenciais = {"usernames": {}}
+    for usuario, dados in usuarios_secrets.items():
+        nome_completo = dados.get("nome", usuario).strip()
+        partes_nome = nome_completo.split(" ", 1)
+        primeiro_nome = partes_nome[0]
+        sobrenome = partes_nome[1] if len(partes_nome) > 1 else ""
+        credenciais["usernames"][usuario] = {
+            "first_name": primeiro_nome,
+            "last_name": sobrenome,
+            "email": dados.get("email", f"{usuario}@empresa.local"),
+            "password": dados["senha"],
+            "failed_login_attempts": 0,
+            "logged_in": False,
+            "roles": ["usuario"],
+        }
+    return credenciais
+
+
 # Configuração da página
 st.set_page_config(page_title="Analisador Contábil Completo", page_icon="📊", layout="wide")
+
+# --- Login ---
+# Protege o app inteiro atrás de usuário/senha, pra ninguém de fora usar o
+# app (e consumir a cota da chave da Groq) só por ter o link. As credenciais
+# ficam nos Secrets do Streamlit, nunca no código. O cookie mantém a pessoa
+# logada por alguns dias, sem precisar digitar usuário/senha toda hora.
+if not st.secrets.get("auth", {}).get("usuarios"):
+    st.error(
+        "⚠️ Nenhum usuário configurado. O administrador precisa cadastrar "
+        "usuários em Settings → Secrets (veja o README)."
+    )
+    st.stop()
+
+auth_cfg = st.secrets.get("auth", {})
+authenticator = stauth.Authenticate(
+    montar_credenciais_login(),
+    auth_cfg.get("cookie_name", "auth_analisador_balanco"),
+    auth_cfg.get("cookie_key", "troque-esta-chave-no-secrets-toml"),
+    auth_cfg.get("cookie_expiry_days", 30),
+)
+
+authenticator.login(location="main")
+
+status_login = st.session_state.get("authentication_status")
+
+if status_login is False:
+    st.error("❌ Usuário ou senha incorretos.")
+    st.stop()
+elif status_login is None:
+    st.info("👋 Faça login para acessar o analisador de balanços.")
+    st.stop()
+
+# A partir daqui o usuário já está autenticado.
+nome_logado = st.session_state.get("name", "")
+authenticator.logout("Sair", "sidebar")
+st.sidebar.caption(f"👤 Logado como **{nome_logado}**")
+# --- Fim do login ---
+
 st.title("📊 Analisador Inteligente de Balanços e DRE")
 st.markdown("Suba o arquivo PDF contábil da empresa para extrair Ativo, Passivo, Patrimônio Líquido, Resultado e Capital de Giro.")
 
-# Busca a chave salva nos Secrets do Streamlit ou pede na barra lateral
+# Busca a chave da Groq nos Secrets do Streamlit. Como o app agora fica atrás
+# de login, a chave é só uma (da empresa) — ninguém precisa colar a própria.
 if "GROQ_API_KEY" in st.secrets:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 else:
-    groq_api_key = st.sidebar.text_input("Insira sua API Key da Groq (Grátis):", type="password")
-    st.sidebar.info("Pegue sua chave gratuita em: https://console.groq.com/")
+    groq_api_key = None
+    st.error(
+        "⚠️ A chave da API da Groq não foi configurada pelo administrador "
+        "(GROQ_API_KEY em Settings → Secrets)."
+    )
 
 # Upload do PDF
 pdf_file = st.file_uploader("Arraste e solte o PDF do Balanço/DRE aqui", type=["pdf"])
@@ -457,4 +542,4 @@ Regras obrigatórias:
                 st.error(f"Erro ao processar o arquivo: {e}")
 
 elif pdf_file and not groq_api_key:
-    st.warning("⚠️ Insira a sua API Key da Groq para continuar.")
+    st.warning("⚠️ O app não está configurado corretamente. Avise o administrador.")
